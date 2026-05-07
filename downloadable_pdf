@@ -1,0 +1,820 @@
+"""
+Demand Creation Chatbot - Final (with PDF Export)
+==================================================
+- Geo resolution: single gemini-2.5-flash call using built-in world knowledge
+- Region mapping: deterministic Python dict, zero extra tokens
+- PDF export: professional reportlab-generated demand payload
+- UI: SharePoint & Google Sites compatible
+"""
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from flask import Flask, request, jsonify, render_template_string, send_file
+import os, json, re
+from io import BytesIO
+from datetime import datetime
+from google import genai
+
+# reportlab imports
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table,
+    TableStyle, HRFlowable, KeepTogether
+)
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY must be set in your .env file")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# =========================================================
+# MANDATORY FIELDS
+# =========================================================
+
+MANDATORY_FIELDS = [
+    {"key": "Demand Title",                                          "question": "What is the Demand Title?"},
+    {"key": "Requirement summary",                                   "question": "Please provide a Requirement Summary."},
+    {"key": "Rationale and Purpose",                                 "question": "What is the Rationale and Purpose of this demand?"},
+    {"key": "Acceptance Criteria",                                   "question": "What are the Acceptance Criteria?"},
+    {"key": "Business Benefits",                                     "question": "What are the Business Benefits?"},
+    {"key": "Business_Process",                                      "question": "What is the Business Process involved?"},
+    {"key": "E2E process in GPM",                                    "question": "What is the E2E Process in GPM?"},
+    {"key": "Area",                                                  "question": "What is the Area / Geographic Location? (e.g. Cairo, Maharashtra, Europe)"},
+    {"key": "Application",                                           "question": "Which Application(s) are Impacted? (e.g. ECC, Fusion, SAP)"},
+    {"key": "Target Go Live Date",                                   "question": "What is the Target Go Live Date? (e.g. 30/06/2026)"},
+    {"key": "Risks if not implemented on Target date",               "question": "What are the Risks if not implemented on the Target Date?"},
+    {"key": "Does this have any month-end (/Year-end) dependency?",  "question": "Does this have any Month-end / Year-end Dependency? (Yes / No)"},
+    {"key": "Is this a legal/fiscal change?",                        "question": "Is this a Legal / Fiscal Change? (Yes / No)"},
+    {"key": "Is Audit requirement",                                  "question": "Is there an Audit Requirement? (Yes / No)"},
+    {"key": "GTS Impact",                                            "question": "Is there a GTS Impact? (Yes / No)"},
+    {"key": "Impacted business groups",                              "question": "Which Business Groups are Impacted? (e.g. Personal Care, Foods)"},
+    {"key": "Landscape Impacted",                                    "question": "Which Landscape is Impacted? (e.g. Fusion, ECC, Both)"},
+    {"key": "Requesting BU",                                         "question": "What is the Requesting Business Unit (BU)?"},
+    {"key": "Potential_savings",                                     "question": "What are the Potential Savings? (enter amount or describe)"},
+]
+
+# =========================================================
+# SESSION STATE
+# =========================================================
+
+session_state = {"captured": {}, "completed": [], "last_payload": {}}
+
+def reset_session():
+    session_state["captured"]     = {}
+    session_state["completed"]    = []
+
+def get_next_field():
+    for field in MANDATORY_FIELDS:
+        if field["key"] not in session_state["completed"]:
+            return field
+    return None
+
+# =========================================================
+# COUNTRY TO REGION MAP
+# gemini-2.5-flash tells us the country.
+# Python maps country to region — zero extra tokens.
+# =========================================================
+
+COUNTRY_TO_REGION = {
+    # North America
+    "United States": "North America", "Canada": "North America", "Mexico": "North America",
+    # Europe
+    "United Kingdom": "Europe", "Germany": "Europe", "France": "Europe", "Italy": "Europe",
+    "Spain": "Europe", "Netherlands": "Europe", "Poland": "Europe", "Switzerland": "Europe",
+    "Sweden": "Europe", "Norway": "Europe", "Denmark": "Europe", "Finland": "Europe",
+    "Ireland": "Europe", "Portugal": "Europe", "Austria": "Europe", "Belgium": "Europe",
+    "Greece": "Europe", "Turkey": "Europe", "Czech Republic": "Europe", "Hungary": "Europe",
+    "Romania": "Europe", "Slovakia": "Europe", "Croatia": "Europe", "Bulgaria": "Europe",
+    "Serbia": "Europe", "Ukraine": "Europe", "Russia": "Europe", "Luxembourg": "Europe",
+    "Estonia": "Europe", "Latvia": "Europe", "Lithuania": "Europe", "Slovenia": "Europe",
+    "Albania": "Europe", "North Macedonia": "Europe", "Bosnia and Herzegovina": "Europe",
+    # Asia-South Pacific
+    "India": "Asia-South Pacific", "Australia": "Asia-South Pacific",
+    "New Zealand": "Asia-South Pacific", "Singapore": "Asia-South Pacific",
+    "Malaysia": "Asia-South Pacific", "Indonesia": "Asia-South Pacific",
+    "Thailand": "Asia-South Pacific", "Vietnam": "Asia-South Pacific",
+    "Philippines": "Asia-South Pacific", "Pakistan": "Asia-South Pacific",
+    "Bangladesh": "Asia-South Pacific", "Sri Lanka": "Asia-South Pacific",
+    "Nepal": "Asia-South Pacific", "Myanmar": "Asia-South Pacific",
+    "Cambodia": "Asia-South Pacific", "Laos": "Asia-South Pacific",
+    "Brunei": "Asia-South Pacific", "Maldives": "Asia-South Pacific",
+    "Bhutan": "Asia-South Pacific", "Papua New Guinea": "Asia-South Pacific",
+    "Fiji": "Asia-South Pacific", "Timor-Leste": "Asia-South Pacific",
+    # Middle East & Africa
+    "Egypt": "Middle East & Africa", "United Arab Emirates": "Middle East & Africa",
+    "Saudi Arabia": "Middle East & Africa", "Nigeria": "Middle East & Africa",
+    "Kenya": "Middle East & Africa", "South Africa": "Middle East & Africa",
+    "Qatar": "Middle East & Africa", "Kuwait": "Middle East & Africa",
+    "Bahrain": "Middle East & Africa", "Oman": "Middle East & Africa",
+    "Jordan": "Middle East & Africa", "Lebanon": "Middle East & Africa",
+    "Israel": "Middle East & Africa", "Ghana": "Middle East & Africa",
+    "Ethiopia": "Middle East & Africa", "Tanzania": "Middle East & Africa",
+    "Morocco": "Middle East & Africa", "Algeria": "Middle East & Africa",
+    "Tunisia": "Middle East & Africa", "Uganda": "Middle East & Africa",
+    "Iraq": "Middle East & Africa", "Iran": "Middle East & Africa",
+    "Yemen": "Middle East & Africa", "Libya": "Middle East & Africa",
+    "Sudan": "Middle East & Africa", "Ivory Coast": "Middle East & Africa",
+    "Senegal": "Middle East & Africa", "Cameroon": "Middle East & Africa",
+    "Angola": "Middle East & Africa", "Mozambique": "Middle East & Africa",
+    "Zambia": "Middle East & Africa", "Zimbabwe": "Middle East & Africa",
+    "Rwanda": "Middle East & Africa", "Botswana": "Middle East & Africa",
+    "Namibia": "Middle East & Africa", "Mauritius": "Middle East & Africa",
+    "Syria": "Middle East & Africa", "Palestine": "Middle East & Africa",
+    "Somalia": "Middle East & Africa",
+    # Latin America
+    "Brazil": "Latin America", "Argentina": "Latin America", "Chile": "Latin America",
+    "Colombia": "Latin America", "Peru": "Latin America", "Ecuador": "Latin America",
+    "Venezuela": "Latin America", "Uruguay": "Latin America", "Paraguay": "Latin America",
+    "Bolivia": "Latin America", "Panama": "Latin America", "Costa Rica": "Latin America",
+    "Dominican Republic": "Latin America", "Guatemala": "Latin America",
+    "Honduras": "Latin America", "El Salvador": "Latin America",
+    "Nicaragua": "Latin America", "Cuba": "Latin America", "Haiti": "Latin America",
+    "Jamaica": "Latin America", "Trinidad and Tobago": "Latin America",
+    "Barbados": "Latin America", "Guyana": "Latin America", "Suriname": "Latin America",
+    # China
+    "China": "China", "Hong Kong": "China", "Macau": "China",
+    # North Asia
+    "Japan": "North Asia", "South Korea": "North Asia", "Taiwan": "North Asia",
+    "Mongolia": "North Asia",
+    # Global
+    "Global": "Global",
+}
+
+# =========================================================
+# GEO INFERENCE — single gemini-2.5-flash call only
+# =========================================================
+
+def infer_geo_from_area(area: str) -> dict:
+    prompt = (
+        "You are a geography expert with complete world knowledge.\n"
+        "Given any location — city, state, province, country, or region — "
+        "identify which country it belongs to.\n\n"
+        "Rules:\n"
+        "- City or town -> its country  (Oklahoma City -> United States, Noida -> India, Osaka -> Japan, Lyon -> France)\n"
+        "- State or province -> its country  (Oklahoma -> United States, Bavaria -> Germany, Ontario -> Canada, Maharashtra -> India)\n"
+        "- Already a country name -> return it exactly in English\n"
+        "- Truly unidentifiable non-geographic term -> return Global\n\n"
+        "Location: \"" + area.strip() + "\"\n\n"
+        "Respond with ONLY this JSON and absolutely nothing else:\n"
+        "{\"country\": \"<country name in English>\"}"
+    )
+    try:
+        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        raw = response.text.strip()
+        raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
+        match = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
+        parsed = json.loads(match.group() if match else raw)
+        country = parsed.get("country", "").strip()
+
+        if country and country in COUNTRY_TO_REGION:
+            region = COUNTRY_TO_REGION[country]
+            return {"Requesting Countries": country, "Requesting Regions": region, "Bill2Country": country}
+
+        if country and country != "Global":
+            return {"Requesting Countries": country, "Requesting Regions": "Global", "Bill2Country": country}
+
+    except Exception:
+        pass
+
+    return {"Requesting Countries": area.strip().title(), "Requesting Regions": "Global", "Bill2Country": area.strip().title()}
+
+# =========================================================
+# PDF GENERATION
+# =========================================================
+
+# Colour palette
+NAVY      = colors.HexColor("#1B2A4A")
+BLUE      = colors.HexColor("#2563EB")
+LIGHT_BG  = colors.HexColor("#EEF2FF")
+MID_BG    = colors.HexColor("#DBEAFE")
+WHITE     = colors.white
+GREY_LINE = colors.HexColor("#CBD5E1")
+DARK_TEXT = colors.HexColor("#1E293B")
+MUTED     = colors.HexColor("#64748B")
+GREEN_BG  = colors.HexColor("#D1FAE5")
+GREEN_TXT = colors.HexColor("#065F46")
+PURPLE_BG = colors.HexColor("#EDE9FE")
+PURPLE_TXT= colors.HexColor("#5B21B6")
+
+# Field groupings for structured PDF layout
+SECTIONS = {
+    "Demand Overview": [
+        "Demand Title", "Requirement summary", "Rationale and Purpose",
+        "Acceptance Criteria", "Business Benefits",
+    ],
+    "Process & Technical": [
+        "Business_Process", "E2E process in GPM", "Application", "Landscape Impacted",
+    ],
+    "Geographic Information": [
+        "Area", "Requesting Countries", "Requesting Regions", "Bill2Country",
+    ],
+    "Timeline & Risk": [
+        "Target Go Live Date", "Risks if not implemented on Target date",
+        "Does this have any month-end (/Year-end) dependency?",
+    ],
+    "Compliance & Impact": [
+        "Is this a legal/fiscal change?", "Is Audit requirement",
+        "GTS Impact", "Impacted business groups",
+    ],
+    "Business Information": [
+        "Requesting BU", "Demand_route", "Potential_savings",
+        "Demand Status", "SubmissionType",
+    ],
+}
+
+AUTO_POPULATED_KEYS = {"Requesting Countries", "Requesting Regions", "Bill2Country"}
+
+
+def generate_demand_pdf(payload: dict) -> BytesIO:
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=18*mm, rightMargin=18*mm,
+        topMargin=20*mm, bottomMargin=20*mm,
+    )
+
+    styles = getSampleStyleSheet()
+
+    # Custom styles
+    style_title = ParagraphStyle(
+        "DemandTitle", parent=styles["Normal"],
+        fontName="Helvetica-Bold", fontSize=22,
+        textColor=WHITE, alignment=TA_CENTER, spaceAfter=2
+    )
+    style_subtitle = ParagraphStyle(
+        "Subtitle", parent=styles["Normal"],
+        fontName="Helvetica", fontSize=9,
+        textColor=colors.HexColor("#93C5FD"), alignment=TA_CENTER
+    )
+    style_section = ParagraphStyle(
+        "SectionHead", parent=styles["Normal"],
+        fontName="Helvetica-Bold", fontSize=10,
+        textColor=WHITE, spaceAfter=0, spaceBefore=0
+    )
+    style_label = ParagraphStyle(
+        "FieldLabel", parent=styles["Normal"],
+        fontName="Helvetica-Bold", fontSize=8.5,
+        textColor=MUTED, spaceAfter=1
+    )
+    style_value = ParagraphStyle(
+        "FieldValue", parent=styles["Normal"],
+        fontName="Helvetica", fontSize=9.5,
+        textColor=DARK_TEXT, spaceAfter=0, leading=13
+    )
+    style_auto = ParagraphStyle(
+        "AutoValue", parent=styles["Normal"],
+        fontName="Helvetica-Bold", fontSize=9.5,
+        textColor=PURPLE_TXT, spaceAfter=0, leading=13
+    )
+    style_footer = ParagraphStyle(
+        "Footer", parent=styles["Normal"],
+        fontName="Helvetica", fontSize=7.5,
+        textColor=MUTED, alignment=TA_CENTER
+    )
+
+    story = []
+
+    # ── HEADER BANNER ─────────────────────────────────────────────────────
+    demand_title = payload.get("Demand Title", "Demand Request")
+    generated_at = datetime.now().strftime("%d %B %Y, %I:%M %p")
+
+    header_data = [[
+        Paragraph("DEMAND CREATION REQUEST", style_title),
+    ],[
+        Paragraph(f"Generated on {generated_at}  |  Status: {payload.get('Demand Status','New')}  |  Type: {payload.get('SubmissionType','Chatbot')}", style_subtitle),
+    ]]
+    header_table = Table(header_data, colWidths=[174*mm])
+    header_table.setStyle(TableStyle([
+        ("BACKGROUND",   (0,0), (-1,-1), NAVY),
+        ("TOPPADDING",   (0,0), (-1,0), 16),
+        ("BOTTOMPADDING",(0,0), (-1,0), 4),
+        ("TOPPADDING",   (0,1), (-1,1), 0),
+        ("BOTTOMPADDING",(0,1), (-1,1), 14),
+        ("ALIGN",        (0,0), (-1,-1), "CENTER"),
+        ("ROUNDEDCORNERS", [6]),
+    ]))
+    story.append(header_table)
+    story.append(Spacer(1, 5*mm))
+
+    # ── DEMAND TITLE CARD ─────────────────────────────────────────────────
+    title_card = Table([[Paragraph(f"<b>{demand_title}</b>", ParagraphStyle(
+        "TCard", fontName="Helvetica-Bold", fontSize=13,
+        textColor=NAVY, alignment=TA_CENTER
+    ))]], colWidths=[174*mm])
+    title_card.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), MID_BG),
+        ("TOPPADDING",    (0,0), (-1,-1), 10),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 10),
+        ("ROUNDEDCORNERS",[6]),
+        ("BOX",           (0,0), (-1,-1), 1, BLUE),
+    ]))
+    story.append(title_card)
+    story.append(Spacer(1, 5*mm))
+
+    # ── SECTIONS ──────────────────────────────────────────────────────────
+    for section_name, keys in SECTIONS.items():
+        # Section header bar
+        sec_header = Table(
+            [[Paragraph(f"  {section_name.upper()}", style_section)]],
+            colWidths=[174*mm]
+        )
+        sec_header.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,-1), BLUE),
+            ("TOPPADDING",    (0,0), (-1,-1), 6),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+            ("ROUNDEDCORNERS",[4]),
+        ]))
+
+        # Rows for this section
+        rows = []
+        for key in keys:
+            value = payload.get(key)
+            if not value:
+                continue
+            is_auto = key in AUTO_POPULATED_KEYS
+            label_para = Paragraph(key.replace("_", " ").upper(), style_label)
+
+            if is_auto:
+                val_para = Paragraph(
+                    f"&#9733; {value}  <font size='7' color='#7C3AED'>[Auto-populated]</font>",
+                    style_auto
+                )
+                bg = PURPLE_BG
+            else:
+                val_para = Paragraph(str(value), style_value)
+                bg = WHITE
+
+            rows.append([label_para, val_para, "" if not is_auto else ""])
+
+        if not rows:
+            continue
+
+        # Build two-column field table
+        field_rows = []
+        # Pair fields side by side where possible for compact layout
+        single_key_fields = {
+            "Demand Title", "Requirement summary", "Rationale and Purpose",
+            "Acceptance Criteria", "Business Benefits",
+            "Risks if not implemented on Target date"
+        }
+
+        i = 0
+        while i < len(keys):
+            key = keys[i]
+            value = payload.get(key)
+            if not value:
+                i += 1
+                continue
+
+            is_auto = key in AUTO_POPULATED_KEYS
+            label_p = Paragraph(key.replace("_", " ").upper(), style_label)
+            val_p   = Paragraph(
+                f"&#9733; {value}  <font size='7' color='#7C3AED'>[Auto]</font>" if is_auto else str(value),
+                style_auto if is_auto else style_value
+            )
+            cell_bg = PURPLE_BG if is_auto else LIGHT_BG
+
+            # Long text fields span full width
+            if key in single_key_fields or len(str(value)) > 80:
+                field_rows.append(("full", label_p, val_p, cell_bg))
+                i += 1
+            else:
+                # Try to pair with next field
+                j = i + 1
+                next_key = None
+                while j < len(keys):
+                    nv = payload.get(keys[j])
+                    if nv:
+                        next_key = keys[j]
+                        break
+                    j += 1
+
+                if next_key and next_key not in single_key_fields and len(str(payload.get(next_key,""))) <= 80:
+                    nv      = payload.get(next_key)
+                    nis_auto= next_key in AUTO_POPULATED_KEYS
+                    nl_p    = Paragraph(next_key.replace("_"," ").upper(), style_label)
+                    nv_p    = Paragraph(
+                        f"&#9733; {nv}  <font size='7' color='#7C3AED'>[Auto]</font>" if nis_auto else str(nv),
+                        style_auto if nis_auto else style_value
+                    )
+                    ncell_bg= PURPLE_BG if nis_auto else LIGHT_BG
+                    field_rows.append(("pair", label_p, val_p, cell_bg, nl_p, nv_p, ncell_bg))
+                    i = j + 1
+                else:
+                    field_rows.append(("full", label_p, val_p, cell_bg))
+                    i += 1
+
+        # Render field rows into a reportlab table
+        tbl_data   = []
+        tbl_styles = [
+            ("ROWBACKGROUNDS", (0,0), (-1,-1), [WHITE, WHITE]),
+            ("GRID",           (0,0), (-1,-1), 0.5, GREY_LINE),
+            ("TOPPADDING",     (0,0), (-1,-1), 6),
+            ("BOTTOMPADDING",  (0,0), (-1,-1), 6),
+            ("LEFTPADDING",    (0,0), (-1,-1), 8),
+            ("RIGHTPADDING",   (0,0), (-1,-1), 8),
+            ("VALIGN",         (0,0), (-1,-1), "TOP"),
+        ]
+
+        ri = 0
+        for row_spec in field_rows:
+            if row_spec[0] == "full":
+                _, lp, vp, bg = row_spec
+                tbl_data.append([lp, vp])
+                tbl_styles += [
+                    ("BACKGROUND", (0,ri),(1,ri), bg),
+                    ("SPAN",       (1,ri),(1,ri)),
+                ]
+            else:
+                _, lp, vp, bg, nlp, nvp, nbg = row_spec
+                # Row 1: labels
+                tbl_data.append([lp, nlp])
+                tbl_styles += [
+                    ("BACKGROUND", (0,ri),(0,ri), bg),
+                    ("BACKGROUND", (1,ri),(1,ri), nbg),
+                    ("TOPPADDING", (0,ri),(1,ri), 5),
+                    ("BOTTOMPADDING",(0,ri),(1,ri), 1),
+                ]
+                ri += 1
+                # Row 2: values
+                tbl_data.append([vp, nvp])
+                tbl_styles += [
+                    ("BACKGROUND",    (0,ri),(0,ri), bg),
+                    ("BACKGROUND",    (1,ri),(1,ri), nbg),
+                    ("TOPPADDING",    (0,ri),(1,ri), 1),
+                    ("BOTTOMPADDING", (0,ri),(1,ri), 7),
+                ]
+            ri += 1
+
+        if tbl_data:
+            field_table = Table(tbl_data, colWidths=[87*mm, 87*mm])
+            field_table.setStyle(TableStyle(tbl_styles))
+
+            story.append(KeepTogether([
+                sec_header,
+                Spacer(1, 2*mm),
+                field_table,
+                Spacer(1, 4*mm),
+            ]))
+
+    # ── FOOTER ────────────────────────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=0.5, color=GREY_LINE))
+    story.append(Spacer(1, 2*mm))
+    story.append(Paragraph(
+        f"This document was auto-generated by the Demand Creation Chatbot &nbsp;|&nbsp; "
+        f"Powered by Gemini 2.5 Flash &nbsp;|&nbsp; {generated_at}",
+        style_footer
+    ))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+# =========================================================
+# FLASK APP
+# =========================================================
+
+app = Flask(__name__)
+
+@app.route("/start", methods=["GET"])
+def start():
+    reset_session()
+    first = MANDATORY_FIELDS[0]
+    return jsonify({
+        "message": "Welcome to the Demand Creation Chatbot! Let's capture your demand step by step.",
+        "next_question": first["question"],
+        "field": first["key"],
+        "progress": f"1 of {len(MANDATORY_FIELDS)}"
+    })
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    payload = request.get_json(silent=True)
+    if not payload or "message" not in payload:
+        return jsonify({"error": "message field is required"}), 400
+    message = payload["message"].strip()
+    if not message:
+        return jsonify({"error": "Empty message received"}), 400
+
+    current_field = get_next_field()
+    if not current_field:
+        return jsonify({"error": "Session already complete. Call /start to reset."}), 400
+
+    session_state["captured"][current_field["key"]] = message
+    session_state["completed"].append(current_field["key"])
+
+    if current_field["key"] == "Area":
+        geo = infer_geo_from_area(message)
+        session_state["captured"]["Requesting Regions"]   = geo.get("Requesting Regions", message)
+        session_state["captured"]["Requesting Countries"] = geo.get("Requesting Countries", message)
+        session_state["captured"]["Bill2Country"]         = geo.get("Bill2Country", message)
+
+    next_field = get_next_field()
+    answered   = len(session_state["completed"])
+    total      = len(MANDATORY_FIELDS)
+
+    if next_field:
+        return jsonify({
+            "captured_field": current_field["key"],
+            "captured_value": message,
+            "next_question":  next_field["question"],
+            "field":          next_field["key"],
+            "progress":       f"{answered + 1} of {total}"
+        })
+
+    final = dict(session_state["captured"])
+    final["Demand Status"]  = "New"
+    final["SubmissionType"] = "Chatbot"
+    if "Requesting BU" in final and "Area" in final:
+        final["Demand_route"] = f"{final['Requesting BU']} - {final['Area']}"
+
+    # Store last payload for PDF download
+    session_state["last_payload"] = final
+
+    auto = {
+        "Requesting Regions":   final.get("Requesting Regions"),
+        "Requesting Countries": final.get("Requesting Countries"),
+        "Bill2Country":         final.get("Bill2Country")
+    }
+    reset_session()
+    return jsonify({
+        "status": "All mandatory fields captured successfully!",
+        "auto_populated": auto,
+        "final_demand_payload": final
+    })
+
+@app.route("/download-pdf", methods=["POST"])
+def download_pdf():
+    """Accepts the full payload as JSON and returns a formatted PDF."""
+    payload = request.get_json(silent=True)
+    if not payload:
+        # Fall back to last captured payload
+        payload = session_state.get("last_payload", {})
+    if not payload:
+        return jsonify({"error": "No payload available"}), 400
+
+    try:
+        pdf_buffer = generate_demand_pdf(payload)
+        filename = f"Demand_{payload.get('Demand Title','Request').replace(' ','_')[:40]}.pdf"
+        return send_file(
+            pdf_buffer,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/reset", methods=["POST"])
+def reset():
+    reset_session()
+    first = MANDATORY_FIELDS[0]
+    return jsonify({
+        "message": "Session reset.",
+        "next_question": first["question"],
+        "field": first["key"]
+    })
+
+@app.route("/ui")
+def ui():
+    total_fields = len(MANDATORY_FIELDS)
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Demand Creation Chatbot</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<style>
+  :root {
+    --bg:#f0f4ff; --surface:#fff; --primary:#2563eb; --primary-dark:#1d4ed8;
+    --accent:#7c3aed; --user-bg:#2563eb; --bot-bg:#f1f5f9; --bot-text:#1e293b;
+    --user-text:#fff; --border:#e2e8f0; --muted:#94a3b8;
+    --radius:16px; --shadow:0 4px 24px rgba(37,99,235,0.08);
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:'DM Sans',sans-serif; background:var(--bg); min-height:100vh;
+    display:flex; align-items:center; justify-content:center; padding:20px; }
+  .container { width:100%; max-width:760px; background:var(--surface);
+    border-radius:var(--radius); box-shadow:var(--shadow); overflow:hidden;
+    display:flex; flex-direction:column; height:90vh; max-height:700px; }
+  .header { background:linear-gradient(135deg,var(--primary),var(--accent));
+    padding:20px 28px; color:white; display:flex; align-items:center;
+    justify-content:space-between; gap:12px; }
+  .header-left h1 { font-size:18px; font-weight:600; letter-spacing:-0.3px; }
+  .header-left p { font-size:12px; opacity:0.8; margin-top:2px; }
+  .reset-btn { background:rgba(255,255,255,0.2); border:1px solid rgba(255,255,255,0.3);
+    color:white; padding:6px 14px; border-radius:8px; cursor:pointer;
+    font-size:12px; font-family:inherit; transition:background 0.2s; }
+  .reset-btn:hover { background:rgba(255,255,255,0.3); }
+  .progress-wrap { background:#e8eeff; padding:10px 28px; display:flex;
+    align-items:center; gap:12px; border-bottom:1px solid var(--border); }
+  .progress-bar-bg { flex:1; height:6px; background:#dde4ff; border-radius:99px; overflow:hidden; }
+  .progress-bar-fill { height:100%; background:linear-gradient(90deg,var(--primary),var(--accent));
+    border-radius:99px; transition:width 0.4s ease; width:0%; }
+  .progress-label { font-size:11px; color:var(--primary); font-weight:600;
+    white-space:nowrap; font-family:'DM Mono',monospace; }
+  .chat-area { flex:1; overflow-y:auto; padding:24px 28px; display:flex;
+    flex-direction:column; gap:14px; scroll-behavior:smooth; }
+  .bubble-row { display:flex; align-items:flex-end; gap:10px; animation:fadeUp 0.3s ease; }
+  .bubble-row.user { flex-direction:row-reverse; }
+  @keyframes fadeUp { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+  .avatar { width:32px; height:32px; border-radius:50%; display:flex;
+    align-items:center; justify-content:center; font-size:14px; flex-shrink:0; }
+  .avatar.bot { background:linear-gradient(135deg,var(--primary),var(--accent)); }
+  .avatar.user { background:#e0e7ff; }
+  .bubble { max-width:78%; padding:12px 16px; border-radius:14px;
+    font-size:14px; line-height:1.55; word-break:break-word; }
+  .bubble.bot { background:var(--bot-bg); color:var(--bot-text); border-bottom-left-radius:4px; }
+  .bubble.user { background:var(--user-bg); color:var(--user-text); border-bottom-right-radius:4px; }
+  .field-tag { font-size:10px; font-weight:600; font-family:'DM Mono',monospace;
+    color:var(--muted); text-transform:uppercase; letter-spacing:0.8px; margin-bottom:4px; }
+  .final-box { background:#f0fdf4; border:1px solid #bbf7d0; border-radius:12px;
+    padding:16px; font-size:12px; font-family:'DM Mono',monospace; color:#064e3b;
+    white-space:pre-wrap; word-break:break-all; max-height:260px; overflow-y:auto; margin-bottom:12px; }
+  .auto-pop-tag { display:inline-block; background:#ede9fe; color:var(--accent);
+    font-size:10px; font-weight:600; font-family:'DM Mono',monospace;
+    padding:2px 8px; border-radius:99px; margin-bottom:6px; }
+  /* PDF download button */
+  .pdf-btn { display:inline-flex; align-items:center; gap:7px;
+    background:linear-gradient(135deg,#059669,#047857);
+    color:white; border:none; border-radius:10px; padding:10px 20px;
+    font-size:13px; font-weight:600; font-family:inherit;
+    cursor:pointer; transition:opacity 0.2s,transform 0.1s; margin-top:4px; }
+  .pdf-btn:hover{opacity:0.9} .pdf-btn:active{transform:scale(0.97)}
+  .pdf-btn:disabled{opacity:0.5;cursor:not-allowed}
+  .typing { display:flex; gap:4px; align-items:center; padding:12px 16px;
+    background:var(--bot-bg); border-radius:14px; border-bottom-left-radius:4px; width:fit-content; }
+  .typing span { width:7px; height:7px; background:var(--muted); border-radius:50%; animation:bounce 1.2s infinite; }
+  .typing span:nth-child(2){animation-delay:0.2s} .typing span:nth-child(3){animation-delay:0.4s}
+  @keyframes bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}
+  .input-area { padding:16px 28px 20px; border-top:1px solid var(--border);
+    display:flex; gap:10px; background:var(--surface); }
+  .input-area input { flex:1; padding:12px 16px; border:1.5px solid var(--border);
+    border-radius:10px; font-size:14px; font-family:inherit; outline:none;
+    transition:border 0.2s; color:var(--bot-text); }
+  .input-area input:focus { border-color:var(--primary); }
+  .input-area input::placeholder { color:var(--muted); }
+  .send-btn { background:linear-gradient(135deg,var(--primary),var(--accent));
+    color:white; border:none; border-radius:10px; padding:12px 22px;
+    font-size:14px; font-weight:600; font-family:inherit; cursor:pointer;
+    transition:opacity 0.2s,transform 0.1s; }
+  .send-btn:hover{opacity:0.92} .send-btn:active{transform:scale(0.97)}
+  .send-btn:disabled{opacity:0.5;cursor:not-allowed}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div class="header-left">
+      <h1>&#9889; Demand Creation Chatbot</h1>
+      <p>Auto-powered by Gemini 2.5 Flash &middot; SharePoint &amp; Google Compatible</p>
+    </div>
+    <button class="reset-btn" onclick="resetChat()">&#8635; Reset</button>
+  </div>
+  <div class="progress-wrap">
+    <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressBar"></div></div>
+    <div class="progress-label" id="progressLabel">Starting...</div>
+  </div>
+  <div class="chat-area" id="chatArea"></div>
+  <div class="input-area">
+    <input type="text" id="inp" placeholder="Type your answer..." onkeydown="if(event.key==='Enter')sendMsg()"/>
+    <button class="send-btn" id="sendBtn" onclick="sendMsg()">Send &rarr;</button>
+  </div>
+</div>
+<script>
+const TOTAL=TOTAL_PLACEHOLDER;
+let started=false;
+let lastPayload=null;
+
+async function startChat(){
+  const res=await fetch('/start');
+  const d=await res.json();
+  addBotMsg(d.message);
+  setTimeout(()=>addBotMsg(d.next_question,d.field,d.progress),600);
+  started=true;
+}
+
+async function sendMsg(){
+  const inp=document.getElementById('inp');
+  const msg=inp.value.trim();
+  if(!msg||!started)return;
+  addUserMsg(msg); inp.value='';
+  document.getElementById('sendBtn').disabled=true;
+  const tid=showTyping();
+  try{
+    const res=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
+    const d=await res.json();
+    removeTyping(tid);
+    if(d.error){
+      addBotMsg('&#9888; '+d.error);
+    } else if(d.final_demand_payload){
+      lastPayload=d.final_demand_payload;
+      const auto=d.auto_populated;
+      addBotMsg('<span class="auto-pop-tag">&#10024; Auto-populated by Gemini</span><br/>'
+        +'<b>Requesting Regions:</b> '+auto['Requesting Regions']+'<br/>'
+        +'<b>Requesting Countries:</b> '+auto['Requesting Countries']+'<br/>'
+        +'<b>Bill2Country:</b> '+auto['Bill2Country']);
+      setTimeout(()=>{
+        addBotMsg(
+          '<b>&#10003; '+d.status+'</b><br/><br/>'
+          +'<div class="final-box">'+JSON.stringify(d.final_demand_payload,null,2)+'</div>'
+          +'<button class="pdf-btn" onclick="downloadPDF()">&#128196; Download as PDF</button>'
+        );
+        updateProgress('Done',100);
+        document.getElementById('inp').disabled=true;
+        document.getElementById('sendBtn').disabled=true;
+      },700);
+    } else {
+      addBotMsg(d.next_question,d.field,d.progress);
+    }
+  } catch(e){ removeTyping(tid); addBotMsg('Network error. Please try again.'); }
+  document.getElementById('sendBtn').disabled=false;
+  document.getElementById('inp').focus();
+}
+
+async function downloadPDF(){
+  if(!lastPayload){ alert('No payload available.'); return; }
+  const btn=document.querySelector('.pdf-btn');
+  if(btn){ btn.disabled=true; btn.textContent='Generating PDF...'; }
+  try{
+    const res=await fetch('/download-pdf',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(lastPayload)
+    });
+    if(!res.ok){ throw new Error('PDF generation failed'); }
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;
+    a.download='Demand_Request.pdf';
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch(e){
+    alert('Error generating PDF: '+e.message);
+  } finally {
+    if(btn){ btn.disabled=false; btn.innerHTML='&#128196; Download as PDF'; }
+  }
+}
+
+function addBotMsg(html,field,progress){
+  const area=document.getElementById('chatArea');
+  const row=document.createElement('div'); row.className='bubble-row bot';
+  let inner=''; if(field) inner='<div class="field-tag">'+field+'</div>'; inner+=html;
+  row.innerHTML='<div class="avatar bot">&#129302;</div><div class="bubble bot">'+inner+'</div>';
+  area.appendChild(row); area.scrollTop=area.scrollHeight;
+  if(progress) updateProgress(progress);
+}
+function addUserMsg(text){
+  const area=document.getElementById('chatArea');
+  const row=document.createElement('div'); row.className='bubble-row user';
+  row.innerHTML='<div class="avatar user">&#129489;</div><div class="bubble user">'+text+'</div>';
+  area.appendChild(row); area.scrollTop=area.scrollHeight;
+}
+function showTyping(){
+  const area=document.getElementById('chatArea');
+  const row=document.createElement('div'); const id='t'+Date.now(); row.id=id;
+  row.className='bubble-row bot';
+  row.innerHTML='<div class="avatar bot">&#129302;</div><div class="typing"><span></span><span></span><span></span></div>';
+  area.appendChild(row); area.scrollTop=area.scrollHeight; return id;
+}
+function removeTyping(id){ const el=document.getElementById(id); if(el)el.remove(); }
+function updateProgress(label,pct){
+  const num=pct!==undefined?pct:(()=>{const p=label.split(' of ');return p.length===2?Math.round(parseInt(p[0])/TOTAL*100):0})();
+  document.getElementById('progressBar').style.width=num+'%';
+  document.getElementById('progressLabel').textContent=pct===100?'&#10003; Complete':'Q '+label;
+}
+async function resetChat(){
+  await fetch('/reset',{method:'POST'});
+  document.getElementById('chatArea').innerHTML='';
+  document.getElementById('inp').disabled=false;
+  document.getElementById('sendBtn').disabled=false;
+  lastPayload=null;
+  updateProgress('',0); started=false; startChat();
+}
+startChat();
+</script>
+</body>
+</html>"""
+    html = html.replace("TOTAL_PLACEHOLDER", str(total_fields))
+    return render_template_string(html)
+
+# =========================================================
+# START SERVER
+# =========================================================
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5050, debug=False, use_reloader=False)
+    
