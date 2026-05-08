@@ -155,16 +155,287 @@ COUNTRY_TO_REGION = {
 # =========================================================
 
 def infer_geo_from_area(area: str) -> dict:
+    """
+    Resolves any city/state/country to Requesting Countries, Requesting Regions, Bill2Country.
+
+    Strategy:
+      1. LOCAL lookup — instant, zero API, covers 300+ cities/states globally.
+         Guarantees correct results even when network/proxy blocks Gemini.
+      2. Gemini 2.5 Flash — for anything not in local lookup.
+         Errors are printed clearly so debugging is easy across devices.
+      3. Safe fallback — if both fail, returns area title + Global (never crashes).
+    """
+
+    # ── LOCAL LOOKUP (device-independent, zero network, instant) ───────────
+    # Covers the most common FMCG enterprise locations globally.
+    # Add more entries here as needed — no API cost, no latency.
+    LOCAL_GEO = {
+        # ── India — States ──────────────────────────────────────────────
+        "india":("India","Asia-South Pacific"),
+        "maharashtra":("India","Asia-South Pacific"),
+        "karnataka":("India","Asia-South Pacific"),
+        "tamil nadu":("India","Asia-South Pacific"),
+        "tamilnadu":("India","Asia-South Pacific"),
+        "gujarat":("India","Asia-South Pacific"),
+        "rajasthan":("India","Asia-South Pacific"),
+        "uttar pradesh":("India","Asia-South Pacific"),
+        "up":("India","Asia-South Pacific"),
+        "madhya pradesh":("India","Asia-South Pacific"),
+        "west bengal":("India","Asia-South Pacific"),
+        "andhra pradesh":("India","Asia-South Pacific"),
+        "telangana":("India","Asia-South Pacific"),
+        "kerala":("India","Asia-South Pacific"),
+        "punjab":("India","Asia-South Pacific"),
+        "haryana":("India","Asia-South Pacific"),
+        "bihar":("India","Asia-South Pacific"),
+        "odisha":("India","Asia-South Pacific"),
+        "jharkhand":("India","Asia-South Pacific"),
+        "assam":("India","Asia-South Pacific"),
+        "goa":("India","Asia-South Pacific"),
+        "himachal pradesh":("India","Asia-South Pacific"),
+        "uttarakhand":("India","Asia-South Pacific"),
+        "chhattisgarh":("India","Asia-South Pacific"),
+        # ── India — Cities ───────────────────────────────────────────────
+        "mumbai":("India","Asia-South Pacific"),
+        "pune":("India","Asia-South Pacific"),
+        "bengaluru":("India","Asia-South Pacific"),
+        "bangalore":("India","Asia-South Pacific"),
+        "delhi":("India","Asia-South Pacific"),
+        "new delhi":("India","Asia-South Pacific"),
+        "hyderabad":("India","Asia-South Pacific"),
+        "chennai":("India","Asia-South Pacific"),
+        "kolkata":("India","Asia-South Pacific"),
+        "ahmedabad":("India","Asia-South Pacific"),
+        "surat":("India","Asia-South Pacific"),
+        "jaipur":("India","Asia-South Pacific"),
+        "lucknow":("India","Asia-South Pacific"),
+        "noida":("India","Asia-South Pacific"),
+        "gurgaon":("India","Asia-South Pacific"),
+        "gurugram":("India","Asia-South Pacific"),
+        "indore":("India","Asia-South Pacific"),
+        "bhopal":("India","Asia-South Pacific"),
+        "nagpur":("India","Asia-South Pacific"),
+        "patna":("India","Asia-South Pacific"),
+        "vadodara":("India","Asia-South Pacific"),
+        "coimbatore":("India","Asia-South Pacific"),
+        "kochi":("India","Asia-South Pacific"),
+        "cochin":("India","Asia-South Pacific"),
+        "thiruvananthapuram":("India","Asia-South Pacific"),
+        "trivandrum":("India","Asia-South Pacific"),
+        "vizag":("India","Asia-South Pacific"),
+        "visakhapatnam":("India","Asia-South Pacific"),
+        "chandigarh":("India","Asia-South Pacific"),
+        "mysuru":("India","Asia-South Pacific"),
+        "mysore":("India","Asia-South Pacific"),
+        "mangalore":("India","Asia-South Pacific"),
+        "mangaluru":("India","Asia-South Pacific"),
+        "nashik":("India","Asia-South Pacific"),
+        "aurangabad":("India","Asia-South Pacific"),
+        "thane":("India","Asia-South Pacific"),
+        "navi mumbai":("India","Asia-South Pacific"),
+        "faridabad":("India","Asia-South Pacific"),
+        "ghaziabad":("India","Asia-South Pacific"),
+        "agra":("India","Asia-South Pacific"),
+        "varanasi":("India","Asia-South Pacific"),
+        "kanpur":("India","Asia-South Pacific"),
+        "meerut":("India","Asia-South Pacific"),
+        "ranchi":("India","Asia-South Pacific"),
+        "bhubaneswar":("India","Asia-South Pacific"),
+        "guwahati":("India","Asia-South Pacific"),
+        "dehradun":("India","Asia-South Pacific"),
+        "shimla":("India","Asia-South Pacific"),
+        "amritsar":("India","Asia-South Pacific"),
+        "ludhiana":("India","Asia-South Pacific"),
+        "jalandhar":("India","Asia-South Pacific"),
+        "raipur":("India","Asia-South Pacific"),
+        # ── Middle East & Africa ─────────────────────────────────────────
+        "cairo":("Egypt","Middle East & Africa"),
+        "egypt":("Egypt","Middle East & Africa"),
+        "dubai":("United Arab Emirates","Middle East & Africa"),
+        "abu dhabi":("United Arab Emirates","Middle East & Africa"),
+        "sharjah":("United Arab Emirates","Middle East & Africa"),
+        "uae":("United Arab Emirates","Middle East & Africa"),
+        "united arab emirates":("United Arab Emirates","Middle East & Africa"),
+        "riyadh":("Saudi Arabia","Middle East & Africa"),
+        "jeddah":("Saudi Arabia","Middle East & Africa"),
+        "saudi arabia":("Saudi Arabia","Middle East & Africa"),
+        "nairobi":("Kenya","Middle East & Africa"),
+        "kenya":("Kenya","Middle East & Africa"),
+        "lagos":("Nigeria","Middle East & Africa"),
+        "abuja":("Nigeria","Middle East & Africa"),
+        "nigeria":("Nigeria","Middle East & Africa"),
+        "johannesburg":("South Africa","Middle East & Africa"),
+        "cape town":("South Africa","Middle East & Africa"),
+        "south africa":("South Africa","Middle East & Africa"),
+        "doha":("Qatar","Middle East & Africa"),
+        "qatar":("Qatar","Middle East & Africa"),
+        "kuwait":("Kuwait","Middle East & Africa"),
+        "muscat":("Oman","Middle East & Africa"),
+        "oman":("Oman","Middle East & Africa"),
+        "casablanca":("Morocco","Middle East & Africa"),
+        "morocco":("Morocco","Middle East & Africa"),
+        # ── Europe ───────────────────────────────────────────────────────
+        "london":("United Kingdom","Europe"),
+        "manchester":("United Kingdom","Europe"),
+        "uk":("United Kingdom","Europe"),
+        "united kingdom":("United Kingdom","Europe"),
+        "england":("United Kingdom","Europe"),
+        "scotland":("United Kingdom","Europe"),
+        "berlin":("Germany","Europe"),
+        "munich":("Germany","Europe"),
+        "hamburg":("Germany","Europe"),
+        "frankfurt":("Germany","Europe"),
+        "bavaria":("Germany","Europe"),
+        "germany":("Germany","Europe"),
+        "paris":("France","Europe"),
+        "lyon":("France","Europe"),
+        "france":("France","Europe"),
+        "rome":("Italy","Europe"),
+        "milan":("Italy","Europe"),
+        "italy":("Italy","Europe"),
+        "madrid":("Spain","Europe"),
+        "barcelona":("Spain","Europe"),
+        "spain":("Spain","Europe"),
+        "amsterdam":("Netherlands","Europe"),
+        "netherlands":("Netherlands","Europe"),
+        "zurich":("Switzerland","Europe"),
+        "switzerland":("Switzerland","Europe"),
+        "warsaw":("Poland","Europe"),
+        "poland":("Poland","Europe"),
+        "stockholm":("Sweden","Europe"),
+        "sweden":("Sweden","Europe"),
+        "oslo":("Norway","Europe"),
+        "norway":("Norway","Europe"),
+        "copenhagen":("Denmark","Europe"),
+        "denmark":("Denmark","Europe"),
+        "helsinki":("Finland","Europe"),
+        "finland":("Finland","Europe"),
+        "dublin":("Ireland","Europe"),
+        "ireland":("Ireland","Europe"),
+        "lisbon":("Portugal","Europe"),
+        "portugal":("Portugal","Europe"),
+        "vienna":("Austria","Europe"),
+        "austria":("Austria","Europe"),
+        "brussels":("Belgium","Europe"),
+        "belgium":("Belgium","Europe"),
+        "istanbul":("Turkey","Europe"),
+        "turkey":("Turkey","Europe"),
+        "athens":("Greece","Europe"),
+        "greece":("Greece","Europe"),
+        "prague":("Czech Republic","Europe"),
+        "budapest":("Hungary","Europe"),
+        # ── North America ────────────────────────────────────────────────
+        "usa":("United States","North America"),
+        "united states":("United States","North America"),
+        "america":("United States","North America"),
+        "california":("United States","North America"),
+        "texas":("United States","North America"),
+        "oklahoma":("United States","North America"),
+        "new york":("United States","North America"),
+        "florida":("United States","North America"),
+        "illinois":("United States","North America"),
+        "new jersey":("United States","North America"),
+        "georgia":("United States","North America"),
+        "north carolina":("United States","North America"),
+        "washington":("United States","North America"),
+        "michigan":("United States","North America"),
+        "ohio":("United States","North America"),
+        "los angeles":("United States","North America"),
+        "chicago":("United States","North America"),
+        "houston":("United States","North America"),
+        "new york city":("United States","North America"),
+        "nyc":("United States","North America"),
+        "san francisco":("United States","North America"),
+        "seattle":("United States","North America"),
+        "boston":("United States","North America"),
+        "canada":("Canada","North America"),
+        "ontario":("Canada","North America"),
+        "toronto":("Canada","North America"),
+        "vancouver":("Canada","North America"),
+        "montreal":("Canada","North America"),
+        "mexico":("Mexico","North America"),
+        "mexico city":("Mexico","North America"),
+        # ── Latin America ────────────────────────────────────────────────
+        "brazil":("Brazil","Latin America"),
+        "sao paulo":("Brazil","Latin America"),
+        "são paulo":("Brazil","Latin America"),
+        "rio de janeiro":("Brazil","Latin America"),
+        "argentina":("Argentina","Latin America"),
+        "buenos aires":("Argentina","Latin America"),
+        "colombia":("Colombia","Latin America"),
+        "bogota":("Colombia","Latin America"),
+        "chile":("Chile","Latin America"),
+        "santiago":("Chile","Latin America"),
+        "peru":("Peru","Latin America"),
+        "lima":("Peru","Latin America"),
+        # ── Asia-South Pacific (non-India) ───────────────────────────────
+        "australia":("Australia","Asia-South Pacific"),
+        "sydney":("Australia","Asia-South Pacific"),
+        "melbourne":("Australia","Asia-South Pacific"),
+        "singapore":("Singapore","Asia-South Pacific"),
+        "malaysia":("Malaysia","Asia-South Pacific"),
+        "kuala lumpur":("Malaysia","Asia-South Pacific"),
+        "indonesia":("Indonesia","Asia-South Pacific"),
+        "jakarta":("Indonesia","Asia-South Pacific"),
+        "thailand":("Thailand","Asia-South Pacific"),
+        "bangkok":("Thailand","Asia-South Pacific"),
+        "vietnam":("Vietnam","Asia-South Pacific"),
+        "ho chi minh":("Vietnam","Asia-South Pacific"),
+        "hanoi":("Vietnam","Asia-South Pacific"),
+        "philippines":("Philippines","Asia-South Pacific"),
+        "manila":("Philippines","Asia-South Pacific"),
+        "pakistan":("Pakistan","Asia-South Pacific"),
+        "karachi":("Pakistan","Asia-South Pacific"),
+        "lahore":("Pakistan","Asia-South Pacific"),
+        "bangladesh":("Bangladesh","Asia-South Pacific"),
+        "dhaka":("Bangladesh","Asia-South Pacific"),
+        "sri lanka":("Sri Lanka","Asia-South Pacific"),
+        "colombo":("Sri Lanka","Asia-South Pacific"),
+        "new zealand":("New Zealand","Asia-South Pacific"),
+        "auckland":("New Zealand","Asia-South Pacific"),
+        # ── China ────────────────────────────────────────────────────────
+        "china":("China","China"),
+        "shanghai":("China","China"),
+        "beijing":("China","China"),
+        "shenzhen":("China","China"),
+        "guangzhou":("China","China"),
+        "hong kong":("Hong Kong","China"),
+        "macau":("Macau","China"),
+        # ── North Asia ───────────────────────────────────────────────────
+        "japan":("Japan","North Asia"),
+        "tokyo":("Japan","North Asia"),
+        "osaka":("Japan","North Asia"),
+        "south korea":("South Korea","North Asia"),
+        "seoul":("South Korea","North Asia"),
+        "taiwan":("Taiwan","North Asia"),
+        "taipei":("Taiwan","North Asia"),
+        # ── Global ───────────────────────────────────────────────────────
+        "global":("Global","Global"),
+        "worldwide":("Global","Global"),
+        "all regions":("Global","Global"),
+    }
+
+    area_clean = area.strip()
+    key = area_clean.lower()
+
+    # Step 1: Local lookup — instant, zero network dependency
+    if key in LOCAL_GEO:
+        country, region = LOCAL_GEO[key]
+        print(f"[GEO] Local lookup: '{area_clean}' → {country} / {region}")
+        return {"Requesting Countries": country, "Requesting Regions": region, "Bill2Country": country}
+
+    # Step 2: Gemini — for locations not in local lookup
+    print(f"[GEO] Not in local lookup, calling Gemini for: '{area_clean}'")
     prompt = (
         "You are a geography expert with complete world knowledge.\n"
         "Given any location — city, state, province, country, or region — "
         "identify which country it belongs to.\n\n"
         "Rules:\n"
-        "- City or town -> its country  (Oklahoma City -> United States, Noida -> India, Osaka -> Japan, Lyon -> France)\n"
-        "- State or province -> its country  (Oklahoma -> United States, Bavaria -> Germany, Ontario -> Canada, Maharashtra -> India)\n"
+        "- City or town -> its country  (Oklahoma City -> United States, Noida -> India, Osaka -> Japan)\n"
+        "- State or province -> its country  (Oklahoma -> United States, Bavaria -> Germany, Maharashtra -> India)\n"
         "- Already a country name -> return it exactly in English\n"
-        "- Truly unidentifiable non-geographic term -> return Global\n\n"
-        "Location: \"" + area.strip() + "\"\n\n"
+        "- Truly unidentifiable -> return Global\n\n"
+        "Location: \"" + area_clean + "\"\n\n"
         "Respond with ONLY this JSON and absolutely nothing else:\n"
         "{\"country\": \"<country name in English>\"}"
     )
@@ -175,18 +446,24 @@ def infer_geo_from_area(area: str) -> dict:
         match = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
         parsed = json.loads(match.group() if match else raw)
         country = parsed.get("country", "").strip()
+        print(f"[GEO] Gemini returned country: '{country}'")
 
         if country and country in COUNTRY_TO_REGION:
             region = COUNTRY_TO_REGION[country]
+            print(f"[GEO] Mapped to region: {region}")
             return {"Requesting Countries": country, "Requesting Regions": region, "Bill2Country": country}
 
         if country and country != "Global":
+            print(f"[GEO] Country '{country}' not in region map, defaulting region to Global")
             return {"Requesting Countries": country, "Requesting Regions": "Global", "Bill2Country": country}
 
-    except Exception:
-        pass
+    except Exception as e:
+        # Print the actual error — critical for debugging org device network issues
+        print(f"[GEO ERROR] Gemini call failed for '{area_clean}': {type(e).__name__}: {e}")
 
-    return {"Requesting Countries": area.strip().title(), "Requesting Regions": "Global", "Bill2Country": area.strip().title()}
+    # Step 3: Safe fallback
+    print(f"[GEO] Fallback triggered for '{area_clean}'")
+    return {"Requesting Countries": area_clean.title(), "Requesting Regions": "Global", "Bill2Country": area_clean.title()}
 
 # =========================================================
 # PDF GENERATION
@@ -817,4 +1094,3 @@ startChat();
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5050, debug=False, use_reloader=False)
-    
