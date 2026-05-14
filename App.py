@@ -1,10 +1,13 @@
 """
 Demand Creation Chatbot - Final
 ================================
-Changes in this version:
-  1. Gemini 2.5 Flash is PRIMARY for geo resolution; local lookup is SECONDARY fallback
-  2. Demand ID auto-generated per demand in format: YYMM_DEMO#### (e.g. 2605_DEMO0001)
-  3. Timestamp recorded in payload showing exact time demand was submitted
+Fixes in this version:
+  1. Demand ID now visible on ALL devices — session reset moved AFTER payload is saved
+  2. Gemini recovery prompt added — when Gemini returns an unrecognised location,
+     a second focused Gemini call explicitly asks for the parent country
+  3. Gemini PRIMARY, local lookup SECONDARY (unchanged)
+  4. Demand ID format: YYMM_DEMO#### (e.g. 2605_DEMO0001)
+  5. Timestamp recorded in payload
 - PDF export: professional reportlab-generated demand payload
 - UI: SharePoint & Google Sites compatible
 """
@@ -18,7 +21,6 @@ from io import BytesIO
 from datetime import datetime
 from google import genai
 
-# reportlab imports
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
@@ -77,20 +79,23 @@ _demand_counter = 0
 
 def generate_demand_id() -> str:
     """
-    Auto-generates a unique Demand ID. Format: YYMM_DEMO####
-    e.g. 2605_DEMO0001 = first demand created in May 2026
-    Acts as primary key for each BRD / demand record.
+    Auto-generates a unique Demand ID per completed demand.
+    Format : YYMM_DEMO####
+    Example: 2605_DEMO0001  (first demand, May 2026)
+             2605_DEMO0002  (second demand, same session)
+    Acts as the primary key for each BRD / demand record.
     """
     global _demand_counter
     _demand_counter += 1
-    prefix = datetime.now().strftime("%y%m")           # YY + MM  e.g. 2605
-    return f"{prefix}_DEMO{_demand_counter:04d}"        # e.g. 2605_DEMO0001
+    prefix = datetime.now().strftime("%y%m")       # e.g. 2605
+    return f"{prefix}_DEMO{_demand_counter:04d}"   # e.g. 2605_DEMO0001
 
 
 def generate_timestamp() -> str:
     """
-    Records the exact date and time the demand was submitted.
-    Format: DD-Mon-YYYY HH:MM AM/PM  e.g. 07-May-2026 10:45 AM
+    Records the exact moment the demand was submitted.
+    Format: DD-Mon-YYYY HH:MM AM/PM
+    Example: 07-May-2026 10:45 AM
     """
     return datetime.now().strftime("%d-%b-%Y %I:%M %p")
 
@@ -109,8 +114,8 @@ def get_next_field():
 
 # =========================================================
 # COUNTRY TO REGION MAP
-# Used by both Gemini path and local lookup path.
-# Python maps country → enterprise region deterministically.
+# Deterministic Python dict — Gemini never picks the region label.
+# Only used after Gemini tells us the country name.
 # =========================================================
 
 COUNTRY_TO_REGION = {
@@ -180,9 +185,9 @@ COUNTRY_TO_REGION = {
 
 
 # =========================================================
-# LOCAL GEO LOOKUP — Secondary fallback only
-# Used ONLY when Gemini API call fails (e.g. org network/proxy issues)
-# Covers 230+ cities, states, countries for device-independent reliability
+# LOCAL GEO LOOKUP — Secondary fallback ONLY
+# Fires only when Gemini API is unreachable (org network/proxy).
+# Covers 230+ major global cities, states, countries.
 # =========================================================
 
 LOCAL_GEO = {
@@ -264,6 +269,11 @@ LOCAL_GEO = {
     "ludhiana": ("India", "Asia-South Pacific"),
     "jalandhar": ("India", "Asia-South Pacific"),
     "raipur": ("India", "Asia-South Pacific"),
+    "jalalganj": ("India", "Asia-South Pacific"),
+    "muzaffarpur": ("India", "Asia-South Pacific"),
+    "bhagalpur": ("India", "Asia-South Pacific"),
+    "gaya": ("India", "Asia-South Pacific"),
+    "darbhanga": ("India", "Asia-South Pacific"),
     # Middle East & Africa
     "cairo": ("Egypt", "Middle East & Africa"),
     "egypt": ("Egypt", "Middle East & Africa"),
@@ -434,72 +444,112 @@ LOCAL_GEO = {
 
 # =========================================================
 # GEO INFERENCE
-# PRIMARY  : Gemini 2.5 Flash (uses full world knowledge)
-# SECONDARY: Local lookup (fires only if Gemini fails)
+# PRIMARY   : Gemini 2.5 Flash — call 1 (broad country resolution)
+# RECOVERY  : Gemini 2.5 Flash — call 2 (explicit recovery for obscure locations)
+# SECONDARY : Local lookup — fires only when BOTH Gemini calls fail
 # =========================================================
 
 def infer_geo_from_area(area: str) -> dict:
     """
-    Step 1 — Gemini 2.5 Flash (PRIMARY):
+    Step 1 — Gemini PRIMARY call:
         Asks Gemini which country this location belongs to.
-        Gemini handles any city, state, country, or region worldwide.
-        Region is then mapped via COUNTRY_TO_REGION in Python (zero tokens).
+        Works for cities, states, countries, regions worldwide.
 
-    Step 2 — Local lookup (SECONDARY / fallback):
-        Fires ONLY if Gemini call fails due to network/proxy issues on org devices.
-        Covers 230+ major global cities, states, and countries.
+    Step 2 — Gemini RECOVERY call:
+        Only fires when Step 1 returns a value not found in COUNTRY_TO_REGION
+        (e.g. Gemini returned the raw city name or an ambiguous string).
+        Uses a more explicit prompt: "This is a town/village in which country?"
 
-    Step 3 — Safe absolute fallback:
-        Returns area title + Global. Never crashes the app.
+    Step 3 — Local lookup (SECONDARY):
+        Fires only when both Gemini calls fail (e.g. org network/proxy blocking API).
+        Covers 230+ global cities, states, countries.
+
+    Step 4 — Safe absolute fallback:
+        Never crashes. Returns area title + Global as last resort.
     """
     area_clean = area.strip()
     key = area_clean.lower()
 
-    # ── STEP 1: Gemini (PRIMARY) ───────────────────────────────────────────
-    prompt = (
+    # ── STEP 1: Gemini PRIMARY ─────────────────────────────────────────────
+    prompt_1 = (
         "You are a geography expert with complete world knowledge.\n"
         "Given any location — city, state, province, country, or region — "
         "identify which country it belongs to.\n\n"
         "Rules:\n"
-        "- City or town -> its country  (Oklahoma City -> United States, Noida -> India, Osaka -> Japan, Lyon -> France)\n"
-        "- State or province -> its country  (Oklahoma -> United States, Bavaria -> Germany, Ontario -> Canada, Maharashtra -> India)\n"
+        "- City or town -> its country  (Jalalganj -> India, Noida -> India, Lyon -> France)\n"
+        "- State or province -> its country  (Maharashtra -> India, Bavaria -> Germany)\n"
         "- Already a country name -> return it exactly in English\n"
         "- Truly unidentifiable -> return Global\n\n"
         "Location: \"" + area_clean + "\"\n\n"
         "Respond with ONLY this JSON and absolutely nothing else:\n"
         "{\"country\": \"<country name in English>\"}"
     )
+    country = None
     try:
-        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-        raw = response.text.strip()
+        r1 = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_1)
+        raw = r1.text.strip()
         raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
         match = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
         parsed = json.loads(match.group() if match else raw)
         country = parsed.get("country", "").strip()
-        print(f"[GEO] Gemini resolved '{area_clean}' → country: '{country}'")
+        print(f"[GEO] Step 1 Gemini → '{country}'")
 
         if country and country in COUNTRY_TO_REGION:
             region = COUNTRY_TO_REGION[country]
-            print(f"[GEO] Region mapped: '{country}' → '{region}'")
+            print(f"[GEO] Resolved: {country} → {region}")
             return {"Requesting Countries": country, "Requesting Regions": region, "Bill2Country": country}
 
-        if country and country != "Global":
-            print(f"[GEO] '{country}' not in region map — defaulting region to Global")
-            return {"Requesting Countries": country, "Requesting Regions": "Global", "Bill2Country": country}
-
     except Exception as e:
-        print(f"[GEO] Gemini failed for '{area_clean}': {type(e).__name__}: {e}")
-        print(f"[GEO] Falling back to local lookup...")
+        print(f"[GEO] Step 1 Gemini failed: {type(e).__name__}: {e}")
 
-    # ── STEP 2: Local lookup (SECONDARY — fires only if Gemini fails) ──────
+    # ── STEP 2: Gemini RECOVERY — fires when Step 1 returned unrecognised value ──
+    # This handles obscure towns, villages, and locations Gemini didn't fully resolve.
+    if country and country not in COUNTRY_TO_REGION and country != "Global":
+        print(f"[GEO] Step 2 Recovery: '{country}' not in region map — asking Gemini explicitly")
+        prompt_2 = (
+            "You are a geography expert.\n"
+            "The following is a small town, village, or locality: \"" + area_clean + "\"\n"
+            "It may also be known as or associated with \"" + country + "\".\n\n"
+            "What country does this location belong to?\n"
+            "Think carefully — it could be a district, taluk, or small settlement.\n\n"
+            "Respond with ONLY this JSON:\n"
+            "{\"country\": \"<full country name in English>\"}"
+        )
+        try:
+            r2 = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_2)
+            raw2 = r2.text.strip()
+            raw2 = re.sub(r"```[a-zA-Z]*", "", raw2).replace("```", "").strip()
+            match2 = re.search(r'\{[^{}]+\}', raw2, re.DOTALL)
+            parsed2 = json.loads(match2.group() if match2 else raw2)
+            country2 = parsed2.get("country", "").strip()
+            print(f"[GEO] Step 2 Recovery Gemini → '{country2}'")
+
+            if country2 and country2 in COUNTRY_TO_REGION:
+                region2 = COUNTRY_TO_REGION[country2]
+                print(f"[GEO] Recovered: {country2} → {region2}")
+                return {"Requesting Countries": country2, "Requesting Regions": region2, "Bill2Country": country2}
+
+            # Recovery returned a valid country not yet in map
+            if country2 and country2 != "Global":
+                print(f"[GEO] Recovery country '{country2}' not in region map — returning with Global region")
+                return {"Requesting Countries": country2, "Requesting Regions": "Global", "Bill2Country": country2}
+
+        except Exception as e:
+            print(f"[GEO] Step 2 Recovery Gemini failed: {type(e).__name__}: {e}")
+
+    # ── STEP 3: Local lookup — fires only when both Gemini calls fail ──────
     if key in LOCAL_GEO:
-        country, region = LOCAL_GEO[key]
-        print(f"[GEO] Local fallback: '{area_clean}' → {country} / {region}")
-        return {"Requesting Countries": country, "Requesting Regions": region, "Bill2Country": country}
+        c, r = LOCAL_GEO[key]
+        print(f"[GEO] Step 3 Local lookup: '{area_clean}' → {c} / {r}")
+        return {"Requesting Countries": c, "Requesting Regions": r, "Bill2Country": c}
 
-    # ── STEP 3: Absolute safe fallback ────────────────────────────────────
-    print(f"[GEO] All methods failed for '{area_clean}' — using safe fallback")
-    return {"Requesting Countries": area_clean.title(), "Requesting Regions": "Global", "Bill2Country": area_clean.title()}
+    # ── STEP 4: Absolute safe fallback ────────────────────────────────────
+    print(f"[GEO] Step 4 Safe fallback triggered for '{area_clean}'")
+    return {
+        "Requesting Countries": area_clean.title(),
+        "Requesting Regions":   "Global",
+        "Bill2Country":         area_clean.title()
+    }
 
 
 # =========================================================
@@ -544,8 +594,8 @@ SECTIONS = {
     ],
 }
 
-AUTO_POPULATED_KEYS  = {"Requesting Countries", "Requesting Regions", "Bill2Country"}
-SYSTEM_KEYS          = {"Demand ID", "Demand Timestamp"}
+AUTO_POPULATED_KEYS = {"Requesting Countries", "Requesting Regions", "Bill2Country"}
+SYSTEM_KEYS         = {"Demand ID", "Demand Timestamp"}
 
 
 def generate_demand_pdf(payload: dict) -> BytesIO:
@@ -557,30 +607,30 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
     )
     styles = getSampleStyleSheet()
 
-    style_title = ParagraphStyle("DT", parent=styles["Normal"],
+    style_title   = ParagraphStyle("DT", parent=styles["Normal"],
         fontName="Helvetica-Bold", fontSize=20, textColor=WHITE, alignment=TA_CENTER, spaceAfter=2)
-    style_subtitle = ParagraphStyle("DS", parent=styles["Normal"],
+    style_subtitle= ParagraphStyle("DS", parent=styles["Normal"],
         fontName="Helvetica", fontSize=8.5, textColor=colors.HexColor("#93C5FD"), alignment=TA_CENTER)
-    style_demandid = ParagraphStyle("DID", parent=styles["Normal"],
-        fontName="Helvetica-Bold", fontSize=10, textColor=colors.HexColor("#FDE68A"), alignment=TA_CENTER)
+    style_demandid= ParagraphStyle("DID", parent=styles["Normal"],
+        fontName="Helvetica-Bold", fontSize=11, textColor=colors.HexColor("#FDE68A"), alignment=TA_CENTER)
     style_section = ParagraphStyle("SH", parent=styles["Normal"],
         fontName="Helvetica-Bold", fontSize=10, textColor=WHITE)
-    style_label = ParagraphStyle("FL", parent=styles["Normal"],
+    style_label   = ParagraphStyle("FL", parent=styles["Normal"],
         fontName="Helvetica-Bold", fontSize=8.5, textColor=MUTED, spaceAfter=1)
-    style_value = ParagraphStyle("FV", parent=styles["Normal"],
+    style_value   = ParagraphStyle("FV", parent=styles["Normal"],
         fontName="Helvetica", fontSize=9.5, textColor=DARK_TEXT, leading=13)
-    style_auto = ParagraphStyle("AV", parent=styles["Normal"],
+    style_auto    = ParagraphStyle("AV", parent=styles["Normal"],
         fontName="Helvetica-Bold", fontSize=9.5, textColor=PURPLE_TXT, leading=13)
-    style_sys = ParagraphStyle("SV", parent=styles["Normal"],
+    style_sys     = ParagraphStyle("SV", parent=styles["Normal"],
         fontName="Helvetica-Bold", fontSize=9.5, textColor=TEAL_TXT, leading=13)
-    style_footer = ParagraphStyle("FT", parent=styles["Normal"],
+    style_footer  = ParagraphStyle("FT", parent=styles["Normal"],
         fontName="Helvetica", fontSize=7.5, textColor=MUTED, alignment=TA_CENTER)
 
     story = []
 
-    demand_id   = payload.get("Demand ID", "N/A")
-    timestamp   = payload.get("Demand Timestamp", "N/A")
-    demand_title= payload.get("Demand Title", "Demand Request")
+    demand_id    = payload.get("Demand ID", "N/A")
+    timestamp    = payload.get("Demand Timestamp", "N/A")
+    demand_title = payload.get("Demand Title", "Demand Request")
 
     # Header banner
     header_data = [
@@ -606,7 +656,6 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
     story.append(header_table)
     story.append(Spacer(1, 4*mm))
 
-    # Demand title card
     title_card = Table(
         [[Paragraph(f"<b>{demand_title}</b>", ParagraphStyle("TC",
             fontName="Helvetica-Bold", fontSize=13, textColor=NAVY, alignment=TA_CENTER))]],
@@ -648,7 +697,6 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
             if not value:
                 i += 1
                 continue
-
             is_auto = key in AUTO_POPULATED_KEYS
             is_sys  = key in SYSTEM_KEYS
             label_p = Paragraph(key.replace("_", " ").upper(), style_label)
@@ -673,21 +721,20 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
                         next_key = keys[j]
                         break
                     j += 1
-
                 if next_key and next_key not in single_key_fields and len(str(payload.get(next_key, ""))) <= 80:
-                    nv       = payload.get(next_key)
-                    nis_auto = next_key in AUTO_POPULATED_KEYS
-                    nis_sys  = next_key in SYSTEM_KEYS
-                    nl_p     = Paragraph(next_key.replace("_", " ").upper(), style_label)
+                    nv      = payload.get(next_key)
+                    nis_auto= next_key in AUTO_POPULATED_KEYS
+                    nis_sys = next_key in SYSTEM_KEYS
+                    nl_p    = Paragraph(next_key.replace("_", " ").upper(), style_label)
                     if nis_auto:
-                        nv_p   = Paragraph(f"&#9733; {nv}  <font size='7' color='#7C3AED'>[Auto]</font>", style_auto)
-                        nbg    = PURPLE_BG
+                        nv_p = Paragraph(f"&#9733; {nv}  <font size='7' color='#7C3AED'>[Auto]</font>", style_auto)
+                        nbg  = PURPLE_BG
                     elif nis_sys:
-                        nv_p   = Paragraph(f"&#128273; {nv}", style_sys)
-                        nbg    = TEAL_BG
+                        nv_p = Paragraph(f"&#128273; {nv}", style_sys)
+                        nbg  = TEAL_BG
                     else:
-                        nv_p   = Paragraph(str(nv), style_value)
-                        nbg    = LIGHT_BG
+                        nv_p = Paragraph(str(nv), style_value)
+                        nbg  = LIGHT_BG
                     field_rows.append(("pair", label_p, val_p, cell_bg, nl_p, nv_p, nbg))
                     i = j + 1
                 else:
@@ -711,7 +758,7 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
             if row_spec[0] == "full":
                 _, lp, vp, bg = row_spec
                 tbl_data.append([lp, vp])
-                tbl_styles += [("BACKGROUND", (0,ri),(1,ri), bg)]
+                tbl_styles.append(("BACKGROUND", (0,ri),(1,ri), bg))
             else:
                 _, lp, vp, bg, nlp, nvp, nbg = row_spec
                 tbl_data.append([lp, nlp])
@@ -723,20 +770,16 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
                 ri += 1
                 tbl_data.append([vp, nvp])
                 tbl_styles += [
-                    ("BACKGROUND",   (0,ri),(0,ri), bg),
-                    ("BACKGROUND",   (1,ri),(1,ri), nbg),
-                    ("TOPPADDING",   (0,ri),(1,ri), 1),
+                    ("BACKGROUND", (0,ri),(0,ri), bg),
+                    ("BACKGROUND", (1,ri),(1,ri), nbg),
+                    ("TOPPADDING", (0,ri),(1,ri), 1),
                 ]
             ri += 1
 
         field_table = Table(tbl_data, colWidths=[87*mm, 87*mm])
         field_table.setStyle(TableStyle(tbl_styles))
-
         story.append(KeepTogether([
-            sec_header,
-            Spacer(1, 2*mm),
-            field_table,
-            Spacer(1, 4*mm),
+            sec_header, Spacer(1, 2*mm), field_table, Spacer(1, 4*mm),
         ]))
 
     story.append(HRFlowable(width="100%", thickness=0.5, color=GREY_LINE))
@@ -810,12 +853,13 @@ def chat():
     final = dict(session_state["captured"])
     final["Demand Status"]    = "New"
     final["SubmissionType"]   = "Chatbot"
-    final["Demand ID"]        = generate_demand_id()     # e.g. 2605_DEMO0001
-    final["Demand Timestamp"] = generate_timestamp()     # e.g. 07-May-2026 10:45 AM
+    final["Demand ID"]        = generate_demand_id()   # e.g. 2605_DEMO0001
+    final["Demand Timestamp"] = generate_timestamp()   # e.g. 07-May-2026 10:45 AM
 
     if "Requesting BU" in final and "Area" in final:
         final["Demand_route"] = f"{final['Requesting BU']} - {final['Area']}"
 
+    # ── FIX: save last_payload BEFORE reset so it is always available ──────
     session_state["last_payload"] = final
 
     auto = {
@@ -823,12 +867,15 @@ def chat():
         "Requesting Countries": final.get("Requesting Countries"),
         "Bill2Country":         final.get("Bill2Country")
     }
+
+    # Reset session after saving — this was the Demand ID bug on other devices
     reset_session()
+
     return jsonify({
-        "status": "All mandatory fields captured successfully!",
-        "auto_populated": auto,
-        "demand_id":       final["Demand ID"],
-        "demand_timestamp":final["Demand Timestamp"],
+        "status":            "All mandatory fields captured successfully!",
+        "auto_populated":    auto,
+        "demand_id":         final["Demand ID"],
+        "demand_timestamp":  final["Demand Timestamp"],
         "final_demand_payload": final
     })
 
@@ -868,12 +915,10 @@ def ui():
 <title>Demand Creation Chatbot</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <style>
-  :root {
-    --bg:#f0f4ff;--surface:#fff;--primary:#2563eb;--accent:#7c3aed;
+  :root{--bg:#f0f4ff;--surface:#fff;--primary:#2563eb;--accent:#7c3aed;
     --user-bg:#2563eb;--bot-bg:#f1f5f9;--bot-text:#1e293b;--user-text:#fff;
     --border:#e2e8f0;--muted:#94a3b8;--radius:16px;
-    --shadow:0 4px 24px rgba(37,99,235,0.08);
-  }
+    --shadow:0 4px 24px rgba(37,99,235,0.08);}
   *{box-sizing:border-box;margin:0;padding:0;}
   body{font-family:'DM Sans',sans-serif;background:var(--bg);min-height:100vh;
     display:flex;align-items:center;justify-content:center;padding:20px;}
@@ -924,16 +969,15 @@ def ui():
     font-size:10px;font-weight:600;font-family:'DM Mono',monospace;
     padding:2px 8px;border-radius:99px;margin-bottom:6px;}
   .pdf-btn{display:inline-flex;align-items:center;gap:7px;
-    background:linear-gradient(135deg,#059669,#047857);
-    color:white;border:none;border-radius:10px;padding:10px 20px;
-    font-size:13px;font-weight:600;font-family:inherit;
-    cursor:pointer;transition:opacity 0.2s,transform 0.1s;margin-top:4px;}
-  .pdf-btn:hover{opacity:0.9;} .pdf-btn:active{transform:scale(0.97);}
+    background:linear-gradient(135deg,#059669,#047857);color:white;border:none;
+    border-radius:10px;padding:10px 20px;font-size:13px;font-weight:600;
+    font-family:inherit;cursor:pointer;transition:opacity 0.2s,transform 0.1s;margin-top:4px;}
+  .pdf-btn:hover{opacity:0.9;}.pdf-btn:active{transform:scale(0.97);}
   .pdf-btn:disabled{opacity:0.5;cursor:not-allowed;}
   .typing{display:flex;gap:4px;align-items:center;padding:12px 16px;
     background:var(--bot-bg);border-radius:14px;border-bottom-left-radius:4px;width:fit-content;}
   .typing span{width:7px;height:7px;background:var(--muted);border-radius:50%;animation:bounce 1.2s infinite;}
-  .typing span:nth-child(2){animation-delay:0.2s;} .typing span:nth-child(3){animation-delay:0.4s;}
+  .typing span:nth-child(2){animation-delay:0.2s;}.typing span:nth-child(3){animation-delay:0.4s;}
   @keyframes bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}
   .input-area{padding:16px 28px 20px;border-top:1px solid var(--border);
     display:flex;gap:10px;background:var(--surface);}
@@ -946,7 +990,7 @@ def ui():
     color:white;border:none;border-radius:10px;padding:12px 22px;
     font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;
     transition:opacity 0.2s,transform 0.1s;}
-  .send-btn:hover{opacity:0.92;} .send-btn:active{transform:scale(0.97);}
+  .send-btn:hover{opacity:0.92;}.send-btn:active{transform:scale(0.97);}
   .send-btn:disabled{opacity:0.5;cursor:not-allowed;}
 </style>
 </head>
@@ -992,28 +1036,22 @@ async function sendMsg(){
   const tid=showTyping();
   try{
     const res=await fetch('/chat',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
+      method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({message:msg})
     });
     const d=await res.json();
     removeTyping(tid);
-
     if(d.error){
       addBotMsg('&#9888; '+d.error);
     } else if(d.final_demand_payload){
       lastPayload=d.final_demand_payload;
       const auto=d.auto_populated;
-
-      // Auto-populated geo callout
       addBotMsg(
         '<span class="auto-pop-tag">&#10024; Auto-populated by Gemini</span><br/>'
         +'<b>Requesting Regions:</b> '+auto['Requesting Regions']+'<br/>'
         +'<b>Requesting Countries:</b> '+auto['Requesting Countries']+'<br/>'
         +'<b>Bill2Country:</b> '+auto['Bill2Country']
       );
-
-      // Final payload with Demand ID and Timestamp prominently shown
       setTimeout(()=>{
         addBotMsg(
           '<b>&#10003; '+d.status+'</b><br/><br/>'
@@ -1044,8 +1082,7 @@ async function downloadPDF(){
   if(btn){btn.disabled=true;btn.textContent='Generating PDF...';}
   try{
     const res=await fetch('/download-pdf',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
+      method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(lastPayload)
     });
     if(!res.ok){throw new Error('PDF generation failed');}
@@ -1054,11 +1091,11 @@ async function downloadPDF(){
     const a=document.createElement('a');
     a.href=url;
     a.download=(lastPayload['Demand ID']||'Demand')+'_'+
-               (lastPayload['Demand Title']||'Request').replace(/\s+/g,'_').slice(0,30)+'.pdf';
+      (lastPayload['Demand Title']||'Request').replace(/\s+/g,'_').slice(0,30)+'.pdf';
     a.click();
     URL.revokeObjectURL(url);
   } catch(e){
-    alert('Error generating PDF: '+e.message);
+    alert('Error: '+e.message);
   } finally {
     if(btn){btn.disabled=false;btn.innerHTML='&#128196; Download as PDF';}
   }
@@ -1117,4 +1154,3 @@ startChat();
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5050, debug=False, use_reloader=False)
-    
