@@ -561,36 +561,56 @@ def infer_geo_from_area(area: str) -> dict:
         Never crashes. Returns area title + Global as last resort.
     """
     area_clean = area.strip()
-    key = area_clean.lower()
+    key        = area_clean.lower()
 
-    # ── STEP 1: Gemini PRIMARY ─────────────────────────────────────────────
+    # ── STEP 1: Gemini PRIMARY — chain-of-thought reasoning prompt ─────────
+    # The reasoning field forces Gemini to think before answering.
+    # This dramatically improves accuracy for Tier 2/3 obscure cities.
+    # "linguistic origin" hint helps when Gemini is uncertain.
     prompt_1 = (
-        "You are a geography expert with complete world knowledge.\n"
-        "Given any location — city, state, province, country, or region — "
-        "identify which COUNTRY it belongs to.\n\n"
-        "IMPORTANT: Always return the COUNTRY NAME, never the city or state name.\n\n"
-        "Rules:\n"
-        "- City or town -> return its COUNTRY  (Canberra -> Australia, Noida -> India, Lyon -> France)\n"
-        "- State or province -> return its COUNTRY  (Maharashtra -> India, Bavaria -> Germany, Queensland -> Australia)\n"
-        "- Already a country name -> return it exactly in English\n"
-        "- Abbreviations -> full country name  (UAE -> United Arab Emirates, UK -> United Kingdom, USA -> United States)\n"
-        "- Truly unidentifiable -> return Global\n\n"
+        "You are a world geography expert with complete knowledge of every city, "
+        "town, village, district, state, and country on Earth.\n\n"
+        "Task: Identify the SOVEREIGN COUNTRY that contains the given location.\n\n"
+        "Think step by step before answering:\n"
+        "Step 1 — What type of place is this? (city / town / village / district / state / country)\n"
+        "Step 2 — If it is a city, town, village, or district: which country does it belong to?\n"
+        "Step 3 — If it is a state or province: which country does it belong to?\n"
+        "Step 4 — If you are uncertain, use the linguistic and cultural origin of the name as a clue.\n\n"
+        "STRICT RULES — violating these is a wrong answer:\n"
+        "- Your \"country\" field MUST be a sovereign nation name\n"
+        "- NEVER put a city, town, village, district, or state in the \"country\" field\n"
+        "- NEVER put an abbreviation like UAE, UK, USA in the \"country\" field\n"
+        "- If the input is already a country name, return it exactly in English\n"
+        "- Only use \"Global\" if the input is completely unrecognisable as any real place\n\n"
+        "Examples of CORRECT answers:\n"
+        "- Bhagalpur     → reasoning: small city in Bihar state, India      → country: India\n"
+        "- Wollongong    → reasoning: coastal city in New South Wales, Australia → country: Australia\n"
+        "- Canberra      → reasoning: capital city of Australia              → country: Australia\n"
+        "- Jalalganj     → reasoning: town in Bihar state, India             → country: India\n"
+        "- Ribeirao Preto→ reasoning: city in Sao Paulo state, Brazil       → country: Brazil\n"
+        "- Multan        → reasoning: city in Punjab province, Pakistan      → country: Pakistan\n"
+        "- Onitsha       → reasoning: city in Anambra state, Nigeria        → country: Nigeria\n"
+        "- Antananarivo  → reasoning: capital city of Madagascar             → country: Madagascar\n"
+        "- Guadalajara   → reasoning: city in Jalisco state, Mexico         → country: Mexico\n"
+        "- Chengdu       → reasoning: city in Sichuan province, China       → country: China\n\n"
         "Location: \"" + area_clean + "\"\n\n"
-        "Respond with ONLY this JSON and absolutely nothing else:\n"
-        "{\"country\": \"<COUNTRY name in English, NOT city or state>\"}"
+        "Respond with ONLY this JSON and nothing else:\n"
+        "{\"reasoning\": \"<one sentence: what this place is and where it is>\", "
+        "\"country\": \"<sovereign country name in full English>\"}"
     )
     country = None
     try:
-        r1 = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_1)
+        r1  = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_1)
         raw = r1.text.strip()
         raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
+        # Extract JSON — handles cases where Gemini adds extra text
         match = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
         parsed = json.loads(match.group() if match else raw)
-        country_raw = parsed.get("country", "").strip()
 
-        # Normalise — handles Gemini returning city names, abbreviations, variants
-        country = normalise_country(country_raw)
-        print(f"[GEO] Step 1 Gemini raw: '{country_raw}' → normalised: '{country}'")
+        country_raw = parsed.get("country", "").strip()
+        reasoning   = parsed.get("reasoning", "")
+        country     = normalise_country(country_raw)
+        print(f"[GEO] Step 1 | reasoning: '{reasoning}' | raw: '{country_raw}' | normalised: '{country}'")
 
         if country and country in COUNTRY_TO_REGION:
             region = COUNTRY_TO_REGION[country]
@@ -601,31 +621,30 @@ def infer_geo_from_area(area: str) -> dict:
         print(f"[GEO] Step 1 Gemini failed: {type(e).__name__}: {e}")
 
     # ── STEP 2: Gemini RECOVERY ────────────────────────────────────────────
-    # Fires when Step 1 returned unrecognised value even after normalisation
+    # Fires when Step 1 returned a value not in COUNTRY_TO_REGION after normalisation.
+    # Uses a hyper-focused prompt with even more explicit instruction.
     if country and country not in COUNTRY_TO_REGION and country != "Global":
-        print(f"[GEO] Step 2 Recovery: '{country}' not in region map — asking Gemini explicitly")
+        print(f"[GEO] Step 2 Recovery — '{country}' not in region map, retrying with focused prompt")
         prompt_2 = (
-            "Geography question — answer in one word or short phrase only.\n\n"
-            "What is the NAME OF THE COUNTRY that contains this location: \"" + area_clean + "\"\n\n"
-            "Do NOT return the city name. Do NOT return the state name.\n"
-            "Return ONLY the sovereign country name in English.\n\n"
-            "For example:\n"
-            "- Canberra → Australia\n"
-            "- Queensland → Australia\n"
-            "- Bavaria → Germany\n"
-            "- Jalalganj → India\n\n"
+            "Strictly answer: which sovereign COUNTRY does \"" + area_clean + "\" belong to?\n\n"
+            "This may be a small town, village, district, or lesser-known city.\n"
+            "Use your knowledge of geography, linguistics, and regional naming conventions.\n\n"
+            "RULES:\n"
+            "- Return the COUNTRY only — never the city, state, or district\n"
+            "- Use the full English country name\n"
+            "- If you got \"" + country + "\" before, that was wrong — think again\n\n"
             "Respond with ONLY this JSON:\n"
             "{\"country\": \"<country name>\"}"
         )
         try:
-            r2 = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_2)
+            r2   = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_2)
             raw2 = r2.text.strip()
             raw2 = re.sub(r"```[a-zA-Z]*", "", raw2).replace("```", "").strip()
-            match2 = re.search(r'\{[^{}]+\}', raw2, re.DOTALL)
-            parsed2 = json.loads(match2.group() if match2 else raw2)
-            country2_raw = parsed2.get("country", "").strip()
-            country2 = normalise_country(country2_raw)
-            print(f"[GEO] Step 2 Recovery raw: '{country2_raw}' → normalised: '{country2}'")
+            match2   = re.search(r'\{[^{}]+\}', raw2, re.DOTALL)
+            parsed2  = json.loads(match2.group() if match2 else raw2)
+            c2_raw   = parsed2.get("country", "").strip()
+            country2 = normalise_country(c2_raw)
+            print(f"[GEO] Step 2 Recovery raw: '{c2_raw}' → normalised: '{country2}'")
 
             if country2 and country2 in COUNTRY_TO_REGION:
                 region2 = COUNTRY_TO_REGION[country2]
@@ -633,7 +652,7 @@ def infer_geo_from_area(area: str) -> dict:
                 return {"Requesting Countries": country2, "Requesting Regions": region2, "Bill2Country": country2}
 
             if country2 and country2 != "Global":
-                print(f"[GEO] Recovery country '{country2}' not in region map")
+                print(f"[GEO] Recovery country '{country2}' not in region map — returning with Global region")
                 return {"Requesting Countries": country2, "Requesting Regions": "Global", "Bill2Country": country2}
 
         except Exception as e:
