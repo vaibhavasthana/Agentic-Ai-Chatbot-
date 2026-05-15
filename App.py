@@ -83,16 +83,20 @@ def generate_demand_id() -> str:
     """
     global _demand_counter
     _demand_counter += 1
-    prefix = datetime.now().strftime("%y%m")           # YY + MM  e.g. 2605
-    return f"{prefix}_DEMO{_demand_counter:04d}"        # e.g. 2605_DEMO0001
+    from datetime import timezone, timedelta
+    IST = timezone(timedelta(hours=5, minutes=30))
+    prefix = datetime.now(IST).strftime("%y%m")        # YY + MM in IST
+    return f"{prefix}_DEMO{_demand_counter:04d}"       # e.g. 2605_DEMO0001
 
 
 def generate_timestamp() -> str:
     """
-    Records the exact date and time the demand was submitted.
-    Format: DD-Mon-YYYY HH:MM AM/PM  e.g. 07-May-2026 10:45 AM
+    Records the exact date and time the demand was submitted in IST (UTC+5:30).
+    Format: DD-Mon-YYYY HH:MM AM/PM IST  e.g. 07-May-2026 10:45 AM IST
     """
-    return datetime.now().strftime("%d-%b-%Y %I:%M %p")
+    from datetime import timezone, timedelta
+    IST = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(IST).strftime("%d-%b-%Y %I:%M %p") + " IST"
 
 
 def reset_session():
