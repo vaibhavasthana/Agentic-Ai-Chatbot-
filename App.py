@@ -434,72 +434,220 @@ LOCAL_GEO = {
 
 # =========================================================
 # GEO INFERENCE
-# PRIMARY  : Gemini 2.5 Flash (uses full world knowledge)
-# SECONDARY: Local lookup (fires only if Gemini fails)
+# PRIMARY   : Gemini 2.5 Flash — call 1 (broad country resolution)
+# RECOVERY  : Gemini 2.5 Flash — call 2 (explicit recovery for unrecognised locations)
+# SECONDARY : Local lookup — fires only when BOTH Gemini calls fail
 # =========================================================
+
+# Normalisation map — catches common Gemini response variations
+# e.g. Gemini returns "Canberra" instead of "Australia"
+# or "The Netherlands" instead of "Netherlands"
+COUNTRY_NORMALISE = {
+    # Australia & NZ
+    "canberra": "Australia", "sydney": "Australia", "melbourne": "Australia",
+    "brisbane": "Australia", "perth": "Australia", "adelaide": "Australia",
+    "gold coast": "Australia", "newcastle": "Australia", "hobart": "Australia",
+    "darwin": "Australia", "queensland": "Australia", "new south wales": "Australia",
+    "victoria": "Australia", "western australia": "Australia",
+    "south australia": "Australia", "tasmania": "Australia",
+    "northern territory": "Australia", "australian capital territory": "Australia",
+    "auckland": "New Zealand", "wellington": "New Zealand", "christchurch": "New Zealand",
+    # India
+    "new delhi": "India", "mumbai": "India", "delhi": "India",
+    "bangalore": "India", "bengaluru": "India", "hyderabad": "India",
+    "chennai": "India", "kolkata": "India", "pune": "India",
+    "ahmedabad": "India", "surat": "India", "jaipur": "India",
+    "noida": "India", "gurgaon": "India", "gurugram": "India",
+    "lucknow": "India", "indore": "India", "nagpur": "India",
+    "maharashtra": "India", "karnataka": "India", "tamil nadu": "India",
+    "gujarat": "India", "rajasthan": "India", "uttar pradesh": "India",
+    "west bengal": "India", "andhra pradesh": "India", "telangana": "India",
+    "kerala": "India", "punjab": "India", "haryana": "India",
+    "jalalganj": "India", "patna": "India", "ranchi": "India",
+    # UK
+    "london": "United Kingdom", "manchester": "United Kingdom",
+    "england": "United Kingdom", "scotland": "United Kingdom",
+    "wales": "United Kingdom", "northern ireland": "United Kingdom",
+    "birmingham": "United Kingdom", "liverpool": "United Kingdom",
+    "great britain": "United Kingdom", "britain": "United Kingdom",
+    # USA
+    "new york": "United States", "los angeles": "United States",
+    "chicago": "United States", "houston": "United States",
+    "washington dc": "United States", "washington d.c.": "United States",
+    "san francisco": "United States", "seattle": "United States",
+    "california": "United States", "texas": "United States",
+    "oklahoma": "United States", "florida": "United States",
+    "new york city": "United States", "nyc": "United States",
+    "u.s.a.": "United States", "u.s.": "United States",
+    "united states of america": "United States",
+    # Canada
+    "toronto": "Canada", "vancouver": "Canada", "montreal": "Canada",
+    "ontario": "Canada", "british columbia": "Canada", "quebec": "Canada",
+    # Germany
+    "berlin": "Germany", "munich": "Germany", "hamburg": "Germany",
+    "frankfurt": "Germany", "bavaria": "Germany",
+    # France
+    "paris": "France", "lyon": "France", "marseille": "France",
+    # Middle East
+    "dubai": "United Arab Emirates", "abu dhabi": "United Arab Emirates",
+    "sharjah": "United Arab Emirates", "u.a.e.": "United Arab Emirates",
+    "riyadh": "Saudi Arabia", "jeddah": "Saudi Arabia",
+    "doha": "Qatar", "muscat": "Oman", "amman": "Jordan",
+    "beirut": "Lebanon", "tel aviv": "Israel",
+    # Africa
+    "cairo": "Egypt", "nairobi": "Kenya", "lagos": "Nigeria",
+    "johannesburg": "South Africa", "cape town": "South Africa",
+    "casablanca": "Morocco", "accra": "Ghana", "addis ababa": "Ethiopia",
+    # Asia
+    "tokyo": "Japan", "osaka": "Japan", "kyoto": "Japan",
+    "seoul": "South Korea", "busan": "South Korea",
+    "taipei": "Taiwan", "hong kong": "Hong Kong",
+    "beijing": "China", "shanghai": "China", "shenzhen": "China",
+    "singapore": "Singapore", "kuala lumpur": "Malaysia",
+    "jakarta": "Indonesia", "bangkok": "Thailand",
+    "ho chi minh city": "Vietnam", "ho chi minh": "Vietnam", "hanoi": "Vietnam",
+    "manila": "Philippines", "dhaka": "Bangladesh",
+    "colombo": "Sri Lanka", "kathmandu": "Nepal",
+    "karachi": "Pakistan", "lahore": "Pakistan", "islamabad": "Pakistan",
+    # Latin America
+    "sao paulo": "Brazil", "são paulo": "Brazil", "rio de janeiro": "Brazil",
+    "buenos aires": "Argentina", "bogota": "Colombia",
+    "santiago": "Chile", "lima": "Peru",
+    # Netherlands variant
+    "the netherlands": "Netherlands", "amsterdam": "Netherlands",
+    "rotterdam": "Netherlands",
+    # Other common variants
+    "republic of ireland": "Ireland", "irish republic": "Ireland",
+    "south korea": "South Korea", "republic of korea": "South Korea",
+    "democratic republic of congo": "Democratic Republic of the Congo",
+    "uae": "United Arab Emirates",
+    "usa": "United States", "uk": "United Kingdom",
+}
+
+
+def normalise_country(raw: str) -> str:
+    """
+    Normalises Gemini's raw country response to a standard name.
+    Handles cases where Gemini returns a city name instead of country,
+    common abbreviations, and alternate country name spellings.
+    """
+    if not raw:
+        return raw
+    check = raw.strip().lower()
+    if check in COUNTRY_NORMALISE:
+        return COUNTRY_NORMALISE[check]
+    return raw.strip()
+
 
 def infer_geo_from_area(area: str) -> dict:
     """
-    Step 1 — Gemini 2.5 Flash (PRIMARY):
+    Step 1 — Gemini PRIMARY call:
         Asks Gemini which country this location belongs to.
-        Gemini handles any city, state, country, or region worldwide.
-        Region is then mapped via COUNTRY_TO_REGION in Python (zero tokens).
+        Result is normalised to handle cases where Gemini returns
+        a city name, abbreviation, or alternate country spelling.
 
-    Step 2 — Local lookup (SECONDARY / fallback):
-        Fires ONLY if Gemini call fails due to network/proxy issues on org devices.
-        Covers 230+ major global cities, states, and countries.
+    Step 2 — Gemini RECOVERY call:
+        Only fires when Step 1 returns a value not found in COUNTRY_TO_REGION
+        after normalisation. Uses a more explicit focused prompt.
 
-    Step 3 — Safe absolute fallback:
-        Returns area title + Global. Never crashes the app.
+    Step 3 — Local lookup (SECONDARY):
+        Fires only when both Gemini calls fail (e.g. org network blocking API).
+
+    Step 4 — Safe absolute fallback:
+        Never crashes. Returns area title + Global as last resort.
     """
     area_clean = area.strip()
     key = area_clean.lower()
 
-    # ── STEP 1: Gemini (PRIMARY) ───────────────────────────────────────────
-    prompt = (
+    # ── STEP 1: Gemini PRIMARY ─────────────────────────────────────────────
+    prompt_1 = (
         "You are a geography expert with complete world knowledge.\n"
         "Given any location — city, state, province, country, or region — "
-        "identify which country it belongs to.\n\n"
+        "identify which COUNTRY it belongs to.\n\n"
+        "IMPORTANT: Always return the COUNTRY NAME, never the city or state name.\n\n"
         "Rules:\n"
-        "- City or town -> its country  (Oklahoma City -> United States, Noida -> India, Osaka -> Japan, Lyon -> France)\n"
-        "- State or province -> its country  (Oklahoma -> United States, Bavaria -> Germany, Ontario -> Canada, Maharashtra -> India)\n"
+        "- City or town -> return its COUNTRY  (Canberra -> Australia, Noida -> India, Lyon -> France)\n"
+        "- State or province -> return its COUNTRY  (Maharashtra -> India, Bavaria -> Germany, Queensland -> Australia)\n"
         "- Already a country name -> return it exactly in English\n"
+        "- Abbreviations -> full country name  (UAE -> United Arab Emirates, UK -> United Kingdom, USA -> United States)\n"
         "- Truly unidentifiable -> return Global\n\n"
         "Location: \"" + area_clean + "\"\n\n"
         "Respond with ONLY this JSON and absolutely nothing else:\n"
-        "{\"country\": \"<country name in English>\"}"
+        "{\"country\": \"<COUNTRY name in English, NOT city or state>\"}"
     )
+    country = None
     try:
-        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-        raw = response.text.strip()
+        r1 = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_1)
+        raw = r1.text.strip()
         raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
         match = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
         parsed = json.loads(match.group() if match else raw)
-        country = parsed.get("country", "").strip()
-        print(f"[GEO] Gemini resolved '{area_clean}' → country: '{country}'")
+        country_raw = parsed.get("country", "").strip()
+
+        # Normalise — handles Gemini returning city names, abbreviations, variants
+        country = normalise_country(country_raw)
+        print(f"[GEO] Step 1 Gemini raw: '{country_raw}' → normalised: '{country}'")
 
         if country and country in COUNTRY_TO_REGION:
             region = COUNTRY_TO_REGION[country]
-            print(f"[GEO] Region mapped: '{country}' → '{region}'")
+            print(f"[GEO] Resolved: {country} → {region}")
             return {"Requesting Countries": country, "Requesting Regions": region, "Bill2Country": country}
 
-        if country and country != "Global":
-            print(f"[GEO] '{country}' not in region map — defaulting region to Global")
-            return {"Requesting Countries": country, "Requesting Regions": "Global", "Bill2Country": country}
-
     except Exception as e:
-        print(f"[GEO] Gemini failed for '{area_clean}': {type(e).__name__}: {e}")
-        print(f"[GEO] Falling back to local lookup...")
+        print(f"[GEO] Step 1 Gemini failed: {type(e).__name__}: {e}")
 
-    # ── STEP 2: Local lookup (SECONDARY — fires only if Gemini fails) ──────
+    # ── STEP 2: Gemini RECOVERY ────────────────────────────────────────────
+    # Fires when Step 1 returned unrecognised value even after normalisation
+    if country and country not in COUNTRY_TO_REGION and country != "Global":
+        print(f"[GEO] Step 2 Recovery: '{country}' not in region map — asking Gemini explicitly")
+        prompt_2 = (
+            "Geography question — answer in one word or short phrase only.\n\n"
+            "What is the NAME OF THE COUNTRY that contains this location: \"" + area_clean + "\"\n\n"
+            "Do NOT return the city name. Do NOT return the state name.\n"
+            "Return ONLY the sovereign country name in English.\n\n"
+            "For example:\n"
+            "- Canberra → Australia\n"
+            "- Queensland → Australia\n"
+            "- Bavaria → Germany\n"
+            "- Jalalganj → India\n\n"
+            "Respond with ONLY this JSON:\n"
+            "{\"country\": \"<country name>\"}"
+        )
+        try:
+            r2 = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_2)
+            raw2 = r2.text.strip()
+            raw2 = re.sub(r"```[a-zA-Z]*", "", raw2).replace("```", "").strip()
+            match2 = re.search(r'\{[^{}]+\}', raw2, re.DOTALL)
+            parsed2 = json.loads(match2.group() if match2 else raw2)
+            country2_raw = parsed2.get("country", "").strip()
+            country2 = normalise_country(country2_raw)
+            print(f"[GEO] Step 2 Recovery raw: '{country2_raw}' → normalised: '{country2}'")
+
+            if country2 and country2 in COUNTRY_TO_REGION:
+                region2 = COUNTRY_TO_REGION[country2]
+                print(f"[GEO] Recovered: {country2} → {region2}")
+                return {"Requesting Countries": country2, "Requesting Regions": region2, "Bill2Country": country2}
+
+            if country2 and country2 != "Global":
+                print(f"[GEO] Recovery country '{country2}' not in region map")
+                return {"Requesting Countries": country2, "Requesting Regions": "Global", "Bill2Country": country2}
+
+        except Exception as e:
+            print(f"[GEO] Step 2 Recovery failed: {type(e).__name__}: {e}")
+
+    # ── STEP 3: Local lookup — fires only when both Gemini calls fail ──────
     if key in LOCAL_GEO:
-        country, region = LOCAL_GEO[key]
-        print(f"[GEO] Local fallback: '{area_clean}' → {country} / {region}")
-        return {"Requesting Countries": country, "Requesting Regions": region, "Bill2Country": country}
+        c, r = LOCAL_GEO[key]
+        print(f"[GEO] Step 3 Local lookup: '{area_clean}' → {c} / {r}")
+        return {"Requesting Countries": c, "Requesting Regions": r, "Bill2Country": c}
 
-    # ── STEP 3: Absolute safe fallback ────────────────────────────────────
-    print(f"[GEO] All methods failed for '{area_clean}' — using safe fallback")
-    return {"Requesting Countries": area_clean.title(), "Requesting Regions": "Global", "Bill2Country": area_clean.title()}
+    # ── STEP 4: Absolute safe fallback ────────────────────────────────────
+    print(f"[GEO] Step 4 Safe fallback triggered for '{area_clean}'")
+    return {
+        "Requesting Countries": area_clean.title(),
+        "Requesting Regions":   "Global",
+        "Bill2Country":         area_clean.title()
+    }
 
 
 # =========================================================
