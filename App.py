@@ -14,6 +14,7 @@ load_dotenv()
 
 from flask import Flask, request, jsonify, render_template_string, send_file
 import os, json, re
+import requests as http_requests
 from io import BytesIO
 from datetime import datetime
 from google import genai
@@ -38,6 +39,107 @@ if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY must be set in your .env file")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+# =========================================================
+# SHAREPOINT CONFIGURATION
+# All values loaded from environment variables — never hardcoded
+# =========================================================
+
+SP_TENANT_ID     = os.getenv("SHAREPOINT_TENANT_ID")
+SP_CLIENT_ID     = os.getenv("SHAREPOINT_CLIENT_ID")
+SP_CLIENT_SECRET = os.getenv("SHAREPOINT_CLIENT_SECRET")
+SP_SITE_ID       = os.getenv("SHAREPOINT_SITE_ID")
+SP_LIST_NAME     = os.getenv("SHAREPOINT_LIST_NAME", "DemandRequests")
+
+_sp_token_cache = {"token": None, "expires_at": 0}
+
+
+def get_sp_access_token() -> str:
+    """
+    Gets a Microsoft Graph API access token using client credentials.
+    Caches the token until it expires to avoid unnecessary API calls.
+    """
+    import time
+    now = time.time()
+    if _sp_token_cache["token"] and now < _sp_token_cache["expires_at"] - 60:
+        return _sp_token_cache["token"]
+
+    url = f"https://login.microsoftonline.com/{SP_TENANT_ID}/oauth2/v2.0/token"
+    data = {
+        "grant_type":    "client_credentials",
+        "client_id":     SP_CLIENT_ID,
+        "client_secret": SP_CLIENT_SECRET,
+        "scope":         "https://graph.microsoft.com/.default"
+    }
+    r = http_requests.post(url, data=data, timeout=15)
+    r.raise_for_status()
+    resp = r.json()
+    _sp_token_cache["token"]      = resp["access_token"]
+    _sp_token_cache["expires_at"] = now + resp.get("expires_in", 3600)
+    return _sp_token_cache["token"]
+
+
+def save_to_sharepoint(payload: dict) -> bool:
+    """
+    Writes the completed demand payload as a new item in the SharePoint List.
+    Maps every payload field to its corresponding SharePoint column.
+    Returns True on success, False on failure (app continues regardless).
+    """
+    if not all([SP_TENANT_ID, SP_CLIENT_ID, SP_CLIENT_SECRET, SP_SITE_ID]):
+        print("[SP] SharePoint credentials not configured — skipping save")
+        return False
+
+    try:
+        token = get_sp_access_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type":  "application/json"
+        }
+
+        # Map payload keys to SharePoint column internal names
+        fields = {
+            "Demand_ID":               payload.get("Demand ID", ""),
+            "Demand_Timestamp":        payload.get("Demand Timestamp", ""),
+            "Demand_Status":           payload.get("Demand Status", "New"),
+            "Submission_Type":         payload.get("SubmissionType", "Chatbot"),
+            "Demand_Route":            payload.get("Demand_route", ""),
+            "Demand_Title":            payload.get("Demand Title", ""),
+            "Requirement_Summary":     payload.get("Requirement summary", ""),
+            "Rationale_And_Purpose":   payload.get("Rationale and Purpose", ""),
+            "Acceptance_Criteria":     payload.get("Acceptance Criteria", ""),
+            "Business_Benefits":       payload.get("Business Benefits", ""),
+            "Business_Process":        payload.get("Business_Process", ""),
+            "E2E_Process_In_GPM":      payload.get("E2E process in GPM", ""),
+            "Application":             payload.get("Application", ""),
+            "Landscape_Impacted":      payload.get("Landscape Impacted", ""),
+            "Area":                    payload.get("Area", ""),
+            "Requesting_Countries":    payload.get("Requesting Countries", ""),
+            "Requesting_Regions":      payload.get("Requesting Regions", ""),
+            "Bill2Country":            payload.get("Bill2Country", ""),
+            "Target_Go_Live_Date":     payload.get("Target Go Live Date", ""),
+            "Risks_If_Not_Implemented":payload.get("Risks if not implemented on Target date", ""),
+            "Month_End_Dependency":    payload.get("Does this have any month-end (/Year-end) dependency?", ""),
+            "Legal_Fiscal_Change":     payload.get("Is this a legal/fiscal change?", ""),
+            "Audit_Requirement":       payload.get("Is Audit requirement", ""),
+            "GTS_Impact":              payload.get("GTS Impact", ""),
+            "Impacted_Business_Groups":payload.get("Impacted business groups", ""),
+            "Requesting_BU":           payload.get("Requesting BU", ""),
+            "Potential_Savings":       payload.get("Potential_savings", ""),
+        }
+
+        # Microsoft Graph API endpoint for SharePoint List items
+        url = f"https://graph.microsoft.com/v1.0/sites/{SP_SITE_ID}/lists/{SP_LIST_NAME}/items"
+        body = {"fields": fields}
+
+        r = http_requests.post(url, headers=headers, json=body, timeout=20)
+        r.raise_for_status()
+        print(f"[SP] Demand saved to SharePoint: {payload.get('Demand ID')} | Status: {r.status_code}")
+        return True
+
+    except Exception as e:
+        print(f"[SP] Failed to save to SharePoint: {type(e).__name__}: {e}")
+        return False
+
 
 # =========================================================
 # MANDATORY FIELDS
@@ -70,28 +172,26 @@ MANDATORY_FIELDS = [
 # =========================================================
 
 session_state = {"captured": {}, "completed": [], "last_payload": {}}
-
-# Increments every time a demand is fully completed in this server session
 _demand_counter = 0
 
 
 def generate_demand_id() -> str:
     """
     Auto-generates a unique Demand ID. Format: YYMM_DEMO####
-    e.g. 2605_DEMO0001 = first demand created in May 2026
+    e.g. 2605_DEMO0001 = first demand created in May 2026 (IST)
     Acts as primary key for each BRD / demand record.
     """
     global _demand_counter
     _demand_counter += 1
     from datetime import timezone, timedelta
     IST = timezone(timedelta(hours=5, minutes=30))
-    prefix = datetime.now(IST).strftime("%y%m")        # YY + MM in IST
-    return f"{prefix}_DEMO{_demand_counter:04d}"       # e.g. 2605_DEMO0001
+    prefix = datetime.now(IST).strftime("%y%m")
+    return f"{prefix}_DEMO{_demand_counter:04d}"
 
 
 def generate_timestamp() -> str:
     """
-    Records the exact date and time the demand was submitted in IST (UTC+5:30).
+    Records the exact moment the demand was submitted in IST (UTC+5:30).
     Format: DD-Mon-YYYY HH:MM AM/PM IST  e.g. 07-May-2026 10:45 AM IST
     """
     from datetime import timezone, timedelta
@@ -112,9 +212,10 @@ def get_next_field():
 
 
 # =========================================================
-# COUNTRY TO REGION MAP
-# Used by both Gemini path and local lookup path.
-# Python maps country → enterprise region deterministically.
+# ENTERPRISE REGION MAP
+# The ONLY hardcoded element — maps sovereign country names
+# to enterprise business regions. Gemini resolves location → country.
+# Python maps country → region deterministically (zero tokens).
 # =========================================================
 
 COUNTRY_TO_REGION = {
@@ -130,6 +231,9 @@ COUNTRY_TO_REGION = {
     "Serbia": "Europe", "Ukraine": "Europe", "Russia": "Europe", "Luxembourg": "Europe",
     "Estonia": "Europe", "Latvia": "Europe", "Lithuania": "Europe", "Slovenia": "Europe",
     "Albania": "Europe", "North Macedonia": "Europe", "Bosnia and Herzegovina": "Europe",
+    "Belarus": "Europe", "Moldova": "Europe", "Kosovo": "Europe", "Montenegro": "Europe",
+    "Cyprus": "Europe", "Malta": "Europe", "Iceland": "Europe", "Liechtenstein": "Europe",
+    "Monaco": "Europe", "San Marino": "Europe", "Andorra": "Europe",
     # Asia-South Pacific
     "India": "Asia-South Pacific", "Australia": "Asia-South Pacific",
     "New Zealand": "Asia-South Pacific", "Singapore": "Asia-South Pacific",
@@ -142,6 +246,12 @@ COUNTRY_TO_REGION = {
     "Brunei": "Asia-South Pacific", "Maldives": "Asia-South Pacific",
     "Bhutan": "Asia-South Pacific", "Papua New Guinea": "Asia-South Pacific",
     "Fiji": "Asia-South Pacific", "Timor-Leste": "Asia-South Pacific",
+    "Solomon Islands": "Asia-South Pacific", "Vanuatu": "Asia-South Pacific",
+    "Samoa": "Asia-South Pacific", "Tonga": "Asia-South Pacific",
+    "Kiribati": "Asia-South Pacific", "Micronesia": "Asia-South Pacific",
+    "Marshall Islands": "Asia-South Pacific", "Palau": "Asia-South Pacific",
+    "Nauru": "Asia-South Pacific", "Tuvalu": "Asia-South Pacific",
+    "Afghanistan": "Asia-South Pacific",
     # Middle East & Africa
     "Egypt": "Middle East & Africa", "United Arab Emirates": "Middle East & Africa",
     "Saudi Arabia": "Middle East & Africa", "Nigeria": "Middle East & Africa",
@@ -162,7 +272,22 @@ COUNTRY_TO_REGION = {
     "Rwanda": "Middle East & Africa", "Botswana": "Middle East & Africa",
     "Namibia": "Middle East & Africa", "Mauritius": "Middle East & Africa",
     "Syria": "Middle East & Africa", "Palestine": "Middle East & Africa",
-    "Somalia": "Middle East & Africa",
+    "Somalia": "Middle East & Africa", "South Sudan": "Middle East & Africa",
+    "Chad": "Middle East & Africa", "Niger": "Middle East & Africa",
+    "Mali": "Middle East & Africa", "Burkina Faso": "Middle East & Africa",
+    "Guinea": "Middle East & Africa", "Sierra Leone": "Middle East & Africa",
+    "Liberia": "Middle East & Africa", "Togo": "Middle East & Africa",
+    "Benin": "Middle East & Africa", "Gabon": "Middle East & Africa",
+    "Equatorial Guinea": "Middle East & Africa", "Congo": "Middle East & Africa",
+    "Democratic Republic of the Congo": "Middle East & Africa",
+    "Central African Republic": "Middle East & Africa",
+    "Madagascar": "Middle East & Africa", "Malawi": "Middle East & Africa",
+    "Lesotho": "Middle East & Africa", "Eswatini": "Middle East & Africa",
+    "Djibouti": "Middle East & Africa", "Eritrea": "Middle East & Africa",
+    "Comoros": "Middle East & Africa", "Seychelles": "Middle East & Africa",
+    "Cape Verde": "Middle East & Africa", "Sao Tome and Principe": "Middle East & Africa",
+    "Guinea-Bissau": "Middle East & Africa", "Gambia": "Middle East & Africa",
+    "Mauritania": "Middle East & Africa",
     # Latin America
     "Brazil": "Latin America", "Argentina": "Latin America", "Chile": "Latin America",
     "Colombia": "Latin America", "Peru": "Latin America", "Ecuador": "Latin America",
@@ -173,499 +298,142 @@ COUNTRY_TO_REGION = {
     "Nicaragua": "Latin America", "Cuba": "Latin America", "Haiti": "Latin America",
     "Jamaica": "Latin America", "Trinidad and Tobago": "Latin America",
     "Barbados": "Latin America", "Guyana": "Latin America", "Suriname": "Latin America",
+    "Belize": "Latin America", "Bahamas": "Latin America",
+    "Saint Lucia": "Latin America", "Grenada": "Latin America",
+    "Saint Vincent and the Grenadines": "Latin America",
+    "Antigua and Barbuda": "Latin America", "Dominica": "Latin America",
+    "Saint Kitts and Nevis": "Latin America",
     # China
     "China": "China", "Hong Kong": "China", "Macau": "China",
     # North Asia
     "Japan": "North Asia", "South Korea": "North Asia", "Taiwan": "North Asia",
-    "Mongolia": "North Asia",
+    "Mongolia": "North Asia", "North Korea": "North Asia",
     # Global
     "Global": "Global",
 }
 
 
 # =========================================================
-# LOCAL GEO LOOKUP — Secondary fallback only
-# Used ONLY when Gemini API call fails (e.g. org network/proxy issues)
-# Covers 230+ cities, states, countries for device-independent reliability
+# GEO INFERENCE — 100% Gemini powered, zero hardcoded lookups
+# Gemini resolves ANY location input (city/village/town/street/
+# district/state/country) to a sovereign country using its
+# built-in world knowledge and chain-of-thought reasoning.
 # =========================================================
-
-LOCAL_GEO = {
-    # India — States
-    "india": ("India", "Asia-South Pacific"),
-    "maharashtra": ("India", "Asia-South Pacific"),
-    "karnataka": ("India", "Asia-South Pacific"),
-    "tamil nadu": ("India", "Asia-South Pacific"),
-    "tamilnadu": ("India", "Asia-South Pacific"),
-    "gujarat": ("India", "Asia-South Pacific"),
-    "rajasthan": ("India", "Asia-South Pacific"),
-    "uttar pradesh": ("India", "Asia-South Pacific"),
-    "up": ("India", "Asia-South Pacific"),
-    "madhya pradesh": ("India", "Asia-South Pacific"),
-    "west bengal": ("India", "Asia-South Pacific"),
-    "andhra pradesh": ("India", "Asia-South Pacific"),
-    "telangana": ("India", "Asia-South Pacific"),
-    "kerala": ("India", "Asia-South Pacific"),
-    "punjab": ("India", "Asia-South Pacific"),
-    "haryana": ("India", "Asia-South Pacific"),
-    "bihar": ("India", "Asia-South Pacific"),
-    "odisha": ("India", "Asia-South Pacific"),
-    "jharkhand": ("India", "Asia-South Pacific"),
-    "assam": ("India", "Asia-South Pacific"),
-    "goa": ("India", "Asia-South Pacific"),
-    "himachal pradesh": ("India", "Asia-South Pacific"),
-    "uttarakhand": ("India", "Asia-South Pacific"),
-    "chhattisgarh": ("India", "Asia-South Pacific"),
-    # India — Cities
-    "mumbai": ("India", "Asia-South Pacific"),
-    "pune": ("India", "Asia-South Pacific"),
-    "bengaluru": ("India", "Asia-South Pacific"),
-    "bangalore": ("India", "Asia-South Pacific"),
-    "delhi": ("India", "Asia-South Pacific"),
-    "new delhi": ("India", "Asia-South Pacific"),
-    "hyderabad": ("India", "Asia-South Pacific"),
-    "chennai": ("India", "Asia-South Pacific"),
-    "kolkata": ("India", "Asia-South Pacific"),
-    "ahmedabad": ("India", "Asia-South Pacific"),
-    "surat": ("India", "Asia-South Pacific"),
-    "jaipur": ("India", "Asia-South Pacific"),
-    "lucknow": ("India", "Asia-South Pacific"),
-    "noida": ("India", "Asia-South Pacific"),
-    "gurgaon": ("India", "Asia-South Pacific"),
-    "gurugram": ("India", "Asia-South Pacific"),
-    "indore": ("India", "Asia-South Pacific"),
-    "bhopal": ("India", "Asia-South Pacific"),
-    "nagpur": ("India", "Asia-South Pacific"),
-    "patna": ("India", "Asia-South Pacific"),
-    "vadodara": ("India", "Asia-South Pacific"),
-    "coimbatore": ("India", "Asia-South Pacific"),
-    "kochi": ("India", "Asia-South Pacific"),
-    "cochin": ("India", "Asia-South Pacific"),
-    "thiruvananthapuram": ("India", "Asia-South Pacific"),
-    "trivandrum": ("India", "Asia-South Pacific"),
-    "vizag": ("India", "Asia-South Pacific"),
-    "visakhapatnam": ("India", "Asia-South Pacific"),
-    "chandigarh": ("India", "Asia-South Pacific"),
-    "mysuru": ("India", "Asia-South Pacific"),
-    "mysore": ("India", "Asia-South Pacific"),
-    "mangalore": ("India", "Asia-South Pacific"),
-    "mangaluru": ("India", "Asia-South Pacific"),
-    "nashik": ("India", "Asia-South Pacific"),
-    "aurangabad": ("India", "Asia-South Pacific"),
-    "thane": ("India", "Asia-South Pacific"),
-    "navi mumbai": ("India", "Asia-South Pacific"),
-    "faridabad": ("India", "Asia-South Pacific"),
-    "ghaziabad": ("India", "Asia-South Pacific"),
-    "agra": ("India", "Asia-South Pacific"),
-    "varanasi": ("India", "Asia-South Pacific"),
-    "kanpur": ("India", "Asia-South Pacific"),
-    "meerut": ("India", "Asia-South Pacific"),
-    "ranchi": ("India", "Asia-South Pacific"),
-    "bhubaneswar": ("India", "Asia-South Pacific"),
-    "guwahati": ("India", "Asia-South Pacific"),
-    "dehradun": ("India", "Asia-South Pacific"),
-    "shimla": ("India", "Asia-South Pacific"),
-    "amritsar": ("India", "Asia-South Pacific"),
-    "ludhiana": ("India", "Asia-South Pacific"),
-    "jalandhar": ("India", "Asia-South Pacific"),
-    "raipur": ("India", "Asia-South Pacific"),
-    # Middle East & Africa
-    "cairo": ("Egypt", "Middle East & Africa"),
-    "egypt": ("Egypt", "Middle East & Africa"),
-    "dubai": ("United Arab Emirates", "Middle East & Africa"),
-    "abu dhabi": ("United Arab Emirates", "Middle East & Africa"),
-    "sharjah": ("United Arab Emirates", "Middle East & Africa"),
-    "uae": ("United Arab Emirates", "Middle East & Africa"),
-    "united arab emirates": ("United Arab Emirates", "Middle East & Africa"),
-    "riyadh": ("Saudi Arabia", "Middle East & Africa"),
-    "jeddah": ("Saudi Arabia", "Middle East & Africa"),
-    "saudi arabia": ("Saudi Arabia", "Middle East & Africa"),
-    "nairobi": ("Kenya", "Middle East & Africa"),
-    "kenya": ("Kenya", "Middle East & Africa"),
-    "lagos": ("Nigeria", "Middle East & Africa"),
-    "abuja": ("Nigeria", "Middle East & Africa"),
-    "nigeria": ("Nigeria", "Middle East & Africa"),
-    "johannesburg": ("South Africa", "Middle East & Africa"),
-    "cape town": ("South Africa", "Middle East & Africa"),
-    "south africa": ("South Africa", "Middle East & Africa"),
-    "doha": ("Qatar", "Middle East & Africa"),
-    "qatar": ("Qatar", "Middle East & Africa"),
-    "kuwait": ("Kuwait", "Middle East & Africa"),
-    "muscat": ("Oman", "Middle East & Africa"),
-    "oman": ("Oman", "Middle East & Africa"),
-    "casablanca": ("Morocco", "Middle East & Africa"),
-    "morocco": ("Morocco", "Middle East & Africa"),
-    # Europe
-    "london": ("United Kingdom", "Europe"),
-    "manchester": ("United Kingdom", "Europe"),
-    "uk": ("United Kingdom", "Europe"),
-    "united kingdom": ("United Kingdom", "Europe"),
-    "england": ("United Kingdom", "Europe"),
-    "scotland": ("United Kingdom", "Europe"),
-    "berlin": ("Germany", "Europe"),
-    "munich": ("Germany", "Europe"),
-    "hamburg": ("Germany", "Europe"),
-    "frankfurt": ("Germany", "Europe"),
-    "bavaria": ("Germany", "Europe"),
-    "germany": ("Germany", "Europe"),
-    "paris": ("France", "Europe"),
-    "lyon": ("France", "Europe"),
-    "france": ("France", "Europe"),
-    "rome": ("Italy", "Europe"),
-    "milan": ("Italy", "Europe"),
-    "italy": ("Italy", "Europe"),
-    "madrid": ("Spain", "Europe"),
-    "barcelona": ("Spain", "Europe"),
-    "spain": ("Spain", "Europe"),
-    "amsterdam": ("Netherlands", "Europe"),
-    "netherlands": ("Netherlands", "Europe"),
-    "zurich": ("Switzerland", "Europe"),
-    "switzerland": ("Switzerland", "Europe"),
-    "warsaw": ("Poland", "Europe"),
-    "poland": ("Poland", "Europe"),
-    "stockholm": ("Sweden", "Europe"),
-    "sweden": ("Sweden", "Europe"),
-    "oslo": ("Norway", "Europe"),
-    "norway": ("Norway", "Europe"),
-    "copenhagen": ("Denmark", "Europe"),
-    "denmark": ("Denmark", "Europe"),
-    "helsinki": ("Finland", "Europe"),
-    "finland": ("Finland", "Europe"),
-    "dublin": ("Ireland", "Europe"),
-    "ireland": ("Ireland", "Europe"),
-    "lisbon": ("Portugal", "Europe"),
-    "portugal": ("Portugal", "Europe"),
-    "vienna": ("Austria", "Europe"),
-    "austria": ("Austria", "Europe"),
-    "brussels": ("Belgium", "Europe"),
-    "belgium": ("Belgium", "Europe"),
-    "istanbul": ("Turkey", "Europe"),
-    "turkey": ("Turkey", "Europe"),
-    "athens": ("Greece", "Europe"),
-    "greece": ("Greece", "Europe"),
-    "prague": ("Czech Republic", "Europe"),
-    "budapest": ("Hungary", "Europe"),
-    # North America
-    "usa": ("United States", "North America"),
-    "united states": ("United States", "North America"),
-    "america": ("United States", "North America"),
-    "california": ("United States", "North America"),
-    "texas": ("United States", "North America"),
-    "oklahoma": ("United States", "North America"),
-    "new york": ("United States", "North America"),
-    "florida": ("United States", "North America"),
-    "illinois": ("United States", "North America"),
-    "new jersey": ("United States", "North America"),
-    "georgia": ("United States", "North America"),
-    "north carolina": ("United States", "North America"),
-    "washington": ("United States", "North America"),
-    "michigan": ("United States", "North America"),
-    "ohio": ("United States", "North America"),
-    "los angeles": ("United States", "North America"),
-    "chicago": ("United States", "North America"),
-    "houston": ("United States", "North America"),
-    "new york city": ("United States", "North America"),
-    "nyc": ("United States", "North America"),
-    "san francisco": ("United States", "North America"),
-    "seattle": ("United States", "North America"),
-    "boston": ("United States", "North America"),
-    "canada": ("Canada", "North America"),
-    "ontario": ("Canada", "North America"),
-    "toronto": ("Canada", "North America"),
-    "vancouver": ("Canada", "North America"),
-    "montreal": ("Canada", "North America"),
-    "mexico": ("Mexico", "North America"),
-    "mexico city": ("Mexico", "North America"),
-    # Latin America
-    "brazil": ("Brazil", "Latin America"),
-    "sao paulo": ("Brazil", "Latin America"),
-    "são paulo": ("Brazil", "Latin America"),
-    "rio de janeiro": ("Brazil", "Latin America"),
-    "argentina": ("Argentina", "Latin America"),
-    "buenos aires": ("Argentina", "Latin America"),
-    "colombia": ("Colombia", "Latin America"),
-    "bogota": ("Colombia", "Latin America"),
-    "chile": ("Chile", "Latin America"),
-    "santiago": ("Chile", "Latin America"),
-    "peru": ("Peru", "Latin America"),
-    "lima": ("Peru", "Latin America"),
-    # Asia-South Pacific (non-India)
-    "australia": ("Australia", "Asia-South Pacific"),
-    "sydney": ("Australia", "Asia-South Pacific"),
-    "melbourne": ("Australia", "Asia-South Pacific"),
-    "singapore": ("Singapore", "Asia-South Pacific"),
-    "malaysia": ("Malaysia", "Asia-South Pacific"),
-    "kuala lumpur": ("Malaysia", "Asia-South Pacific"),
-    "indonesia": ("Indonesia", "Asia-South Pacific"),
-    "jakarta": ("Indonesia", "Asia-South Pacific"),
-    "thailand": ("Thailand", "Asia-South Pacific"),
-    "bangkok": ("Thailand", "Asia-South Pacific"),
-    "vietnam": ("Vietnam", "Asia-South Pacific"),
-    "ho chi minh": ("Vietnam", "Asia-South Pacific"),
-    "hanoi": ("Vietnam", "Asia-South Pacific"),
-    "philippines": ("Philippines", "Asia-South Pacific"),
-    "manila": ("Philippines", "Asia-South Pacific"),
-    "pakistan": ("Pakistan", "Asia-South Pacific"),
-    "karachi": ("Pakistan", "Asia-South Pacific"),
-    "lahore": ("Pakistan", "Asia-South Pacific"),
-    "bangladesh": ("Bangladesh", "Asia-South Pacific"),
-    "dhaka": ("Bangladesh", "Asia-South Pacific"),
-    "sri lanka": ("Sri Lanka", "Asia-South Pacific"),
-    "colombo": ("Sri Lanka", "Asia-South Pacific"),
-    "new zealand": ("New Zealand", "Asia-South Pacific"),
-    "auckland": ("New Zealand", "Asia-South Pacific"),
-    # China
-    "china": ("China", "China"),
-    "shanghai": ("China", "China"),
-    "beijing": ("China", "China"),
-    "shenzhen": ("China", "China"),
-    "guangzhou": ("China", "China"),
-    "hong kong": ("Hong Kong", "China"),
-    "macau": ("Macau", "China"),
-    # North Asia
-    "japan": ("Japan", "North Asia"),
-    "tokyo": ("Japan", "North Asia"),
-    "osaka": ("Japan", "North Asia"),
-    "south korea": ("South Korea", "North Asia"),
-    "seoul": ("South Korea", "North Asia"),
-    "taiwan": ("Taiwan", "North Asia"),
-    "taipei": ("Taiwan", "North Asia"),
-    # Global
-    "global": ("Global", "Global"),
-    "worldwide": ("Global", "Global"),
-    "all regions": ("Global", "Global"),
-}
-
-
-# =========================================================
-# GEO INFERENCE
-# PRIMARY   : Gemini 2.5 Flash — call 1 (broad country resolution)
-# RECOVERY  : Gemini 2.5 Flash — call 2 (explicit recovery for unrecognised locations)
-# SECONDARY : Local lookup — fires only when BOTH Gemini calls fail
-# =========================================================
-
-# Normalisation map — catches common Gemini response variations
-# e.g. Gemini returns "Canberra" instead of "Australia"
-# or "The Netherlands" instead of "Netherlands"
-COUNTRY_NORMALISE = {
-    # Australia & NZ
-    "canberra": "Australia", "sydney": "Australia", "melbourne": "Australia",
-    "brisbane": "Australia", "perth": "Australia", "adelaide": "Australia",
-    "gold coast": "Australia", "newcastle": "Australia", "hobart": "Australia",
-    "darwin": "Australia", "queensland": "Australia", "new south wales": "Australia",
-    "victoria": "Australia", "western australia": "Australia",
-    "south australia": "Australia", "tasmania": "Australia",
-    "northern territory": "Australia", "australian capital territory": "Australia",
-    "auckland": "New Zealand", "wellington": "New Zealand", "christchurch": "New Zealand",
-    # India
-    "new delhi": "India", "mumbai": "India", "delhi": "India",
-    "bangalore": "India", "bengaluru": "India", "hyderabad": "India",
-    "chennai": "India", "kolkata": "India", "pune": "India",
-    "ahmedabad": "India", "surat": "India", "jaipur": "India",
-    "noida": "India", "gurgaon": "India", "gurugram": "India",
-    "lucknow": "India", "indore": "India", "nagpur": "India",
-    "maharashtra": "India", "karnataka": "India", "tamil nadu": "India",
-    "gujarat": "India", "rajasthan": "India", "uttar pradesh": "India",
-    "west bengal": "India", "andhra pradesh": "India", "telangana": "India",
-    "kerala": "India", "punjab": "India", "haryana": "India",
-    "jalalganj": "India", "patna": "India", "ranchi": "India",
-    # UK
-    "london": "United Kingdom", "manchester": "United Kingdom",
-    "england": "United Kingdom", "scotland": "United Kingdom",
-    "wales": "United Kingdom", "northern ireland": "United Kingdom",
-    "birmingham": "United Kingdom", "liverpool": "United Kingdom",
-    "great britain": "United Kingdom", "britain": "United Kingdom",
-    # USA
-    "new york": "United States", "los angeles": "United States",
-    "chicago": "United States", "houston": "United States",
-    "washington dc": "United States", "washington d.c.": "United States",
-    "san francisco": "United States", "seattle": "United States",
-    "california": "United States", "texas": "United States",
-    "oklahoma": "United States", "florida": "United States",
-    "new york city": "United States", "nyc": "United States",
-    "u.s.a.": "United States", "u.s.": "United States",
-    "united states of america": "United States",
-    # Canada
-    "toronto": "Canada", "vancouver": "Canada", "montreal": "Canada",
-    "ontario": "Canada", "british columbia": "Canada", "quebec": "Canada",
-    # Germany
-    "berlin": "Germany", "munich": "Germany", "hamburg": "Germany",
-    "frankfurt": "Germany", "bavaria": "Germany",
-    # France
-    "paris": "France", "lyon": "France", "marseille": "France",
-    # Middle East
-    "dubai": "United Arab Emirates", "abu dhabi": "United Arab Emirates",
-    "sharjah": "United Arab Emirates", "u.a.e.": "United Arab Emirates",
-    "riyadh": "Saudi Arabia", "jeddah": "Saudi Arabia",
-    "doha": "Qatar", "muscat": "Oman", "amman": "Jordan",
-    "beirut": "Lebanon", "tel aviv": "Israel",
-    # Africa
-    "cairo": "Egypt", "nairobi": "Kenya", "lagos": "Nigeria",
-    "johannesburg": "South Africa", "cape town": "South Africa",
-    "casablanca": "Morocco", "accra": "Ghana", "addis ababa": "Ethiopia",
-    # Asia
-    "tokyo": "Japan", "osaka": "Japan", "kyoto": "Japan",
-    "seoul": "South Korea", "busan": "South Korea",
-    "taipei": "Taiwan", "hong kong": "Hong Kong",
-    "beijing": "China", "shanghai": "China", "shenzhen": "China",
-    "singapore": "Singapore", "kuala lumpur": "Malaysia",
-    "jakarta": "Indonesia", "bangkok": "Thailand",
-    "ho chi minh city": "Vietnam", "ho chi minh": "Vietnam", "hanoi": "Vietnam",
-    "manila": "Philippines", "dhaka": "Bangladesh",
-    "colombo": "Sri Lanka", "kathmandu": "Nepal",
-    "karachi": "Pakistan", "lahore": "Pakistan", "islamabad": "Pakistan",
-    # Latin America
-    "sao paulo": "Brazil", "são paulo": "Brazil", "rio de janeiro": "Brazil",
-    "buenos aires": "Argentina", "bogota": "Colombia",
-    "santiago": "Chile", "lima": "Peru",
-    # Netherlands variant
-    "the netherlands": "Netherlands", "amsterdam": "Netherlands",
-    "rotterdam": "Netherlands",
-    # Other common variants
-    "republic of ireland": "Ireland", "irish republic": "Ireland",
-    "south korea": "South Korea", "republic of korea": "South Korea",
-    "democratic republic of congo": "Democratic Republic of the Congo",
-    "uae": "United Arab Emirates",
-    "usa": "United States", "uk": "United Kingdom",
-}
-
-
-def normalise_country(raw: str) -> str:
-    """
-    Normalises Gemini's raw country response to a standard name.
-    Handles cases where Gemini returns a city name instead of country,
-    common abbreviations, and alternate country name spellings.
-    """
-    if not raw:
-        return raw
-    check = raw.strip().lower()
-    if check in COUNTRY_NORMALISE:
-        return COUNTRY_NORMALISE[check]
-    return raw.strip()
-
 
 def infer_geo_from_area(area: str) -> dict:
     """
-    Step 1 — Gemini PRIMARY call:
-        Asks Gemini which country this location belongs to.
-        Result is normalised to handle cases where Gemini returns
-        a city name, abbreviation, or alternate country spelling.
+    Fully Gemini-powered geo resolution. No hardcoded city/state lists.
 
-    Step 2 — Gemini RECOVERY call:
-        Only fires when Step 1 returns a value not found in COUNTRY_TO_REGION
-        after normalisation. Uses a more explicit focused prompt.
+    Call 1 — PRIMARY: chain-of-thought prompt asking Gemini to reason
+              step by step before returning a country. Works for Tier 1/2/3
+              cities, villages, streets, districts — anything.
 
-    Step 3 — Local lookup (SECONDARY):
-        Fires only when both Gemini calls fail (e.g. org network blocking API).
+    Call 2 — RECOVERY: fires only if Call 1 returns something not in
+              COUNTRY_TO_REGION. Gives Gemini a second chance with a
+              more explicit focused prompt.
 
-    Step 4 — Safe absolute fallback:
-        Never crashes. Returns area title + Global as last resort.
+    Fallback — only if BOTH Gemini calls fail due to network/API issues.
+               Returns area as-is with Global region. Never crashes the app.
     """
     area_clean = area.strip()
-    key        = area_clean.lower()
 
-    # ── STEP 1: Gemini PRIMARY — chain-of-thought reasoning prompt ─────────
-    # The reasoning field forces Gemini to think before answering.
-    # This dramatically improves accuracy for Tier 2/3 obscure cities.
-    # "linguistic origin" hint helps when Gemini is uncertain.
+    # ── CALL 1: PRIMARY — chain-of-thought reasoning ───────────────────────
     prompt_1 = (
         "You are a world geography expert with complete knowledge of every city, "
-        "town, village, district, state, and country on Earth.\n\n"
+        "town, village, district, street, neighbourhood, state, and country on Earth.\n\n"
         "Task: Identify the SOVEREIGN COUNTRY that contains the given location.\n\n"
-        "Think step by step before answering:\n"
-        "Step 1 — What type of place is this? (city / town / village / district / state / country)\n"
-        "Step 2 — If it is a city, town, village, or district: which country does it belong to?\n"
-        "Step 3 — If it is a state or province: which country does it belong to?\n"
-        "Step 4 — If you are uncertain, use the linguistic and cultural origin of the name as a clue.\n\n"
-        "STRICT RULES — violating these is a wrong answer:\n"
-        "- Your \"country\" field MUST be a sovereign nation name\n"
-        "- NEVER put a city, town, village, district, or state in the \"country\" field\n"
-        "- NEVER put an abbreviation like UAE, UK, USA in the \"country\" field\n"
-        "- If the input is already a country name, return it exactly in English\n"
-        "- Only use \"Global\" if the input is completely unrecognisable as any real place\n\n"
-        "Examples of CORRECT answers:\n"
-        "- Bhagalpur     → reasoning: small city in Bihar state, India      → country: India\n"
-        "- Wollongong    → reasoning: coastal city in New South Wales, Australia → country: Australia\n"
-        "- Canberra      → reasoning: capital city of Australia              → country: Australia\n"
-        "- Jalalganj     → reasoning: town in Bihar state, India             → country: India\n"
-        "- Ribeirao Preto→ reasoning: city in Sao Paulo state, Brazil       → country: Brazil\n"
-        "- Multan        → reasoning: city in Punjab province, Pakistan      → country: Pakistan\n"
-        "- Onitsha       → reasoning: city in Anambra state, Nigeria        → country: Nigeria\n"
-        "- Antananarivo  → reasoning: capital city of Madagascar             → country: Madagascar\n"
-        "- Guadalajara   → reasoning: city in Jalisco state, Mexico         → country: Mexico\n"
-        "- Chengdu       → reasoning: city in Sichuan province, China       → country: China\n\n"
+        "The input can be ANYTHING — a major city, a small village, a street name, "
+        "a district, a neighbourhood, a state, a territory, or a country name itself.\n\n"
+        "Think step by step:\n"
+        "1. What type of place is this? (city / town / village / street / district / state / country)\n"
+        "2. Which sovereign country does it belong to?\n"
+        "3. If uncertain, use the linguistic and cultural origin of the name as a clue.\n\n"
+        "STRICT RULES:\n"
+        "- The \"country\" field MUST be a sovereign nation — never a city, state, or district\n"
+        "- Write the full country name in English (e.g. \"United States\", not \"US\" or \"USA\")\n"
+        "- If already a country name, return it exactly in English\n"
+        "- Only return \"Global\" if the input is completely non-geographic\n\n"
+        "Examples:\n"
+        "Bhagalpur → {reasoning: city in Bihar, India, country: India}\n"
+        "Wollongong → {reasoning: coastal city in New South Wales, country: Australia}\n"
+        "Canberra → {reasoning: capital city of Australia, country: Australia}\n"
+        "Ribeirao Preto → {reasoning: city in Sao Paulo state, country: Brazil}\n"
+        "Onitsha → {reasoning: city in Anambra state, country: Nigeria}\n"
+        "Multan → {reasoning: city in Punjab province, country: Pakistan}\n"
+        "Antananarivo → {reasoning: capital of Madagascar, country: Madagascar}\n"
+        "Guadalajara → {reasoning: city in Jalisco state, country: Mexico}\n"
+        "Chengdu → {reasoning: city in Sichuan province, country: China}\n"
+        "MG Road → {reasoning: street name common in Indian cities, country: India}\n"
+        "Shibuya → {reasoning: district in Tokyo, country: Japan}\n"
+        "Mitte → {reasoning: central district of Berlin, country: Germany}\n\n"
         "Location: \"" + area_clean + "\"\n\n"
-        "Respond with ONLY this JSON and nothing else:\n"
-        "{\"reasoning\": \"<one sentence: what this place is and where it is>\", "
+        "Return ONLY this JSON, nothing else:\n"
+        "{\"reasoning\": \"<one sentence explaining what this place is>\", "
         "\"country\": \"<sovereign country name in full English>\"}"
     )
+
     country = None
     try:
-        r1  = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_1)
-        raw = r1.text.strip()
-        raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
-        # Extract JSON — handles cases where Gemini adds extra text
-        match = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
-        parsed = json.loads(match.group() if match else raw)
-
-        country_raw = parsed.get("country", "").strip()
-        reasoning   = parsed.get("reasoning", "")
-        country     = normalise_country(country_raw)
-        print(f"[GEO] Step 1 | reasoning: '{reasoning}' | raw: '{country_raw}' | normalised: '{country}'")
+        r1      = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_1)
+        raw     = r1.text.strip()
+        raw     = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
+        match   = re.search(r'\{.*?\}', raw, re.DOTALL)
+        parsed  = json.loads(match.group() if match else raw)
+        country = parsed.get("country", "").strip()
+        reasoning = parsed.get("reasoning", "")
+        print(f"[GEO] Call 1 | reasoning: {reasoning} | country: {country}")
 
         if country and country in COUNTRY_TO_REGION:
             region = COUNTRY_TO_REGION[country]
             print(f"[GEO] Resolved: {country} → {region}")
             return {"Requesting Countries": country, "Requesting Regions": region, "Bill2Country": country}
 
+        # Country returned but not in our map — still valid, just use Global for region
+        if country and country not in ("", "Global"):
+            print(f"[GEO] Country '{country}' not in region map — returning with Global region")
+            return {"Requesting Countries": country, "Requesting Regions": "Global", "Bill2Country": country}
+
     except Exception as e:
-        print(f"[GEO] Step 1 Gemini failed: {type(e).__name__}: {e}")
+        print(f"[GEO] Call 1 failed: {type(e).__name__}: {e}")
 
-    # ── STEP 2: Gemini RECOVERY ────────────────────────────────────────────
-    # Fires when Step 1 returned a value not in COUNTRY_TO_REGION after normalisation.
-    # Uses a hyper-focused prompt with even more explicit instruction.
-    if country and country not in COUNTRY_TO_REGION and country != "Global":
-        print(f"[GEO] Step 2 Recovery — '{country}' not in region map, retrying with focused prompt")
-        prompt_2 = (
-            "Strictly answer: which sovereign COUNTRY does \"" + area_clean + "\" belong to?\n\n"
-            "This may be a small town, village, district, or lesser-known city.\n"
-            "Use your knowledge of geography, linguistics, and regional naming conventions.\n\n"
-            "RULES:\n"
-            "- Return the COUNTRY only — never the city, state, or district\n"
-            "- Use the full English country name\n"
-            "- If you got \"" + country + "\" before, that was wrong — think again\n\n"
-            "Respond with ONLY this JSON:\n"
-            "{\"country\": \"<country name>\"}"
-        )
-        try:
-            r2   = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_2)
-            raw2 = r2.text.strip()
-            raw2 = re.sub(r"```[a-zA-Z]*", "", raw2).replace("```", "").strip()
-            match2   = re.search(r'\{[^{}]+\}', raw2, re.DOTALL)
-            parsed2  = json.loads(match2.group() if match2 else raw2)
-            c2_raw   = parsed2.get("country", "").strip()
-            country2 = normalise_country(c2_raw)
-            print(f"[GEO] Step 2 Recovery raw: '{c2_raw}' → normalised: '{country2}'")
+    # ── CALL 2: RECOVERY — focused retry when Call 1 gives wrong result ────
+    print(f"[GEO] Call 2 Recovery triggered for: '{area_clean}'")
+    prompt_2 = (
+        "Geography question. Give a one-word or short-phrase answer only.\n\n"
+        "Location: \"" + area_clean + "\"\n\n"
+        "This could be a small village, minor town, district, neighbourhood, "
+        "street, or any lesser-known place anywhere in the world.\n\n"
+        "What is the SOVEREIGN COUNTRY this location belongs to?\n\n"
+        "Rules:\n"
+        "- Return the COUNTRY name only — not city, not state, not district\n"
+        "- Full English name (e.g. United States, not USA)\n"
+        "- Use linguistic, cultural, or regional context if needed\n\n"
+        "Return ONLY this JSON:\n"
+        "{\"country\": \"<country name>\"}"
+    )
+    try:
+        r2      = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_2)
+        raw2    = r2.text.strip()
+        raw2    = re.sub(r"```[a-zA-Z]*", "", raw2).replace("```", "").strip()
+        match2  = re.search(r'\{.*?\}', raw2, re.DOTALL)
+        parsed2 = json.loads(match2.group() if match2 else raw2)
+        country2 = parsed2.get("country", "").strip()
+        print(f"[GEO] Call 2 Recovery country: {country2}")
 
-            if country2 and country2 in COUNTRY_TO_REGION:
-                region2 = COUNTRY_TO_REGION[country2]
-                print(f"[GEO] Recovered: {country2} → {region2}")
-                return {"Requesting Countries": country2, "Requesting Regions": region2, "Bill2Country": country2}
+        if country2 and country2 in COUNTRY_TO_REGION:
+            region2 = COUNTRY_TO_REGION[country2]
+            print(f"[GEO] Recovered: {country2} → {region2}")
+            return {"Requesting Countries": country2, "Requesting Regions": region2, "Bill2Country": country2}
 
-            if country2 and country2 != "Global":
-                print(f"[GEO] Recovery country '{country2}' not in region map — returning with Global region")
-                return {"Requesting Countries": country2, "Requesting Regions": "Global", "Bill2Country": country2}
+        if country2 and country2 not in ("", "Global"):
+            print(f"[GEO] Recovery country '{country2}' not in region map")
+            return {"Requesting Countries": country2, "Requesting Regions": "Global", "Bill2Country": country2}
 
-        except Exception as e:
-            print(f"[GEO] Step 2 Recovery failed: {type(e).__name__}: {e}")
+    except Exception as e:
+        print(f"[GEO] Call 2 Recovery failed: {type(e).__name__}: {e}")
 
-    # ── STEP 3: Local lookup — fires only when both Gemini calls fail ──────
-    if key in LOCAL_GEO:
-        c, r = LOCAL_GEO[key]
-        print(f"[GEO] Step 3 Local lookup: '{area_clean}' → {c} / {r}")
-        return {"Requesting Countries": c, "Requesting Regions": r, "Bill2Country": c}
-
-    # ── STEP 4: Absolute safe fallback ────────────────────────────────────
-    print(f"[GEO] Step 4 Safe fallback triggered for '{area_clean}'")
+    # ── FALLBACK — only if BOTH Gemini calls fail (network/API issue) ──────
+    print(f"[GEO] Both Gemini calls failed for '{area_clean}' — using safe fallback")
     return {
         "Requesting Countries": area_clean.title(),
         "Requesting Regions":   "Global",
@@ -989,6 +757,9 @@ def chat():
 
     session_state["last_payload"] = final
 
+    # Save to SharePoint List (non-blocking — app works even if this fails)
+    sp_saved = save_to_sharepoint(final)
+
     auto = {
         "Requesting Regions":   final.get("Requesting Regions"),
         "Requesting Countries": final.get("Requesting Countries"),
@@ -996,10 +767,11 @@ def chat():
     }
     reset_session()
     return jsonify({
-        "status": "All mandatory fields captured successfully!",
-        "auto_populated": auto,
-        "demand_id":       final["Demand ID"],
-        "demand_timestamp":final["Demand Timestamp"],
+        "status":              "All mandatory fields captured successfully!",
+        "sharepoint_saved":    sp_saved,
+        "auto_populated":      auto,
+        "demand_id":           final["Demand ID"],
+        "demand_timestamp":    final["Demand Timestamp"],
         "final_demand_payload": final
     })
 
