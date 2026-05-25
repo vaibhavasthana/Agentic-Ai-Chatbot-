@@ -42,62 +42,95 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 # =========================================================
 # SHAREPOINT CONFIGURATION
-# All values loaded from environment variables — never hardcoded
+# Uses SharePoint REST API with username/password authentication.
+# No admin consent required — works with any SharePoint user account.
 # =========================================================
 
-SP_TENANT_ID     = os.getenv("SHAREPOINT_TENANT_ID")
-SP_CLIENT_ID     = os.getenv("SHAREPOINT_CLIENT_ID")
-SP_CLIENT_SECRET = os.getenv("SHAREPOINT_CLIENT_SECRET")
-SP_SITE_ID       = os.getenv("SHAREPOINT_SITE_ID")
-SP_LIST_NAME     = os.getenv("SHAREPOINT_LIST_NAME", "DemandRequests")
+SP_SITE_URL  = os.getenv("SHAREPOINT_SITE_URL")   # e.g. https://associatesscit0.sharepoint.com/sites/DemandChatbot
+SP_USERNAME  = os.getenv("SHAREPOINT_USERNAME")    # your Microsoft login email
+SP_PASSWORD  = os.getenv("SHAREPOINT_PASSWORD")    # your Microsoft login password
+SP_LIST_NAME = os.getenv("SHAREPOINT_LIST_NAME", "DemandRequests")
 
-_sp_token_cache = {"token": None, "expires_at": 0}
+_sp_digest_cache = {"digest": None, "expires_at": 0}
 
 
-def get_sp_access_token() -> str:
+def get_sp_request_digest() -> tuple:
     """
-    Gets a Microsoft Graph API access token using client credentials.
-    Caches the token until it expires to avoid unnecessary API calls.
+    Gets a SharePoint Form Digest value for REST API authentication.
+    Uses username/password — no admin consent needed.
+    Returns (cookies, digest_value).
     """
     import time
-    now = time.time()
-    if _sp_token_cache["token"] and now < _sp_token_cache["expires_at"] - 60:
-        return _sp_token_cache["token"]
+    # Step 1: Sign in and get session cookies
+    signin_url = "https://login.microsoftonline.com/extSTS.srf"
+    signin_body = f"""<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+      xmlns:a="http://www.w3.org/2005/08/addressing"
+      xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+  <s:Header>
+    <a:Action s:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2005/02/trust/RST/Issue</a:Action>
+    <a:To s:mustUnderstand="1">https://login.microsoftonline.com/extSTS.srf</a:To>
+  </s:Header>
+  <s:Body>
+    <t:RequestSecurityToken xmlns:t="http://schemas.xmlsoap.org/ws/2005/02/trust">
+      <wsp:AppliesTo xmlns:wsp="http://schemas.xmlsoap.org/ws/2004/09/policy">
+        <a:EndpointReference><a:Address>{SP_SITE_URL}</a:Address></a:EndpointReference>
+      </wsp:AppliesTo>
+      <t:KeyType>http://schemas.xmlsoap.org/ws/2005/05/identity/NoProofKey</t:KeyType>
+      <t:RequestType>http://schemas.xmlsoap.org/ws/2005/02/trust/Issue</t:RequestType>
+      <t:TokenType>urn:ietf:params:oauth:token-type:jwt</t:TokenType>
+      <o:UsernameToken xmlns:o="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+        <o:Username>{SP_USERNAME}</o:Username>
+        <o:Password>{SP_PASSWORD}</o:Password>
+      </o:UsernameToken>
+    </t:RequestSecurityToken>
+  </s:Body>
+</s:Envelope>"""
 
-    url = f"https://login.microsoftonline.com/{SP_TENANT_ID}/oauth2/v2.0/token"
-    data = {
-        "grant_type":    "client_credentials",
-        "client_id":     SP_CLIENT_ID,
-        "client_secret": SP_CLIENT_SECRET,
-        "scope":         "https://graph.microsoft.com/.default"
-    }
-    r = http_requests.post(url, data=data, timeout=15)
-    r.raise_for_status()
-    resp = r.json()
-    _sp_token_cache["token"]      = resp["access_token"]
-    _sp_token_cache["expires_at"] = now + resp.get("expires_in", 3600)
-    return _sp_token_cache["token"]
+    r1 = http_requests.post(signin_url, data=signin_body,
+                            headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+                            timeout=20)
+
+    # Extract security token
+    token_match = re.search(r"<wsse:BinarySecurityToken[^>]*>(.*?)</wsse:BinarySecurityToken>",
+                            r1.text, re.DOTALL)
+    if not token_match:
+        raise ValueError("Could not extract security token from Microsoft login")
+    security_token = token_match.group(1)
+
+    # Step 2: Get SharePoint session cookie
+    session = http_requests.Session()
+    sts_url = SP_SITE_URL.rstrip("/") + "/_forms/default.aspx?wa=wsignin1.0"
+    r2 = session.post(sts_url, data=security_token,
+                      headers={"Content-Type": "application/x-www-form-urlencoded"},
+                      timeout=20, allow_redirects=True)
+
+    # Step 3: Get form digest
+    digest_url = SP_SITE_URL.rstrip("/") + "/_api/contextinfo"
+    r3 = session.post(digest_url,
+                      headers={"Accept": "application/json;odata=verbose"},
+                      timeout=20)
+    r3.raise_for_status()
+    digest = r3.json()["d"]["GetContextWebInformation"]["FormDigestValue"]
+    return session, digest
 
 
 def save_to_sharepoint(payload: dict) -> bool:
     """
-    Writes the completed demand payload as a new item in the SharePoint List.
-    Maps every payload field to its corresponding SharePoint column.
+    Writes the completed demand payload as a new item in the SharePoint List
+    using SharePoint REST API with username/password authentication.
+    No admin consent or app registration needed.
     Returns True on success, False on failure (app continues regardless).
     """
-    if not all([SP_TENANT_ID, SP_CLIENT_ID, SP_CLIENT_SECRET, SP_SITE_ID]):
+    if not all([SP_SITE_URL, SP_USERNAME, SP_PASSWORD]):
         print("[SP] SharePoint credentials not configured — skipping save")
         return False
 
     try:
-        token = get_sp_access_token()
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type":  "application/json"
-        }
+        session, digest = get_sp_request_digest()
 
         # Map payload keys to SharePoint column internal names
-        fields = {
+        item_data = {
+            "__metadata": {"type": f"SP.Data.{SP_LIST_NAME}ListItem"},
             "Demand_ID":               payload.get("Demand ID", ""),
             "Demand_Timestamp":        payload.get("Demand Timestamp", ""),
             "Demand_Status":           payload.get("Demand Status", "New"),
@@ -127,13 +160,17 @@ def save_to_sharepoint(payload: dict) -> bool:
             "Potential_Savings":       payload.get("Potential_savings", ""),
         }
 
-        # Microsoft Graph API endpoint for SharePoint List items
-        url = f"https://graph.microsoft.com/v1.0/sites/{SP_SITE_ID}/lists/{SP_LIST_NAME}/items"
-        body = {"fields": fields}
+        list_url = f"{SP_SITE_URL.rstrip('/')}/_api/web/lists/getbytitle('{SP_LIST_NAME}')/items"
+        headers = {
+            "Accept":          "application/json;odata=verbose",
+            "Content-Type":    "application/json;odata=verbose",
+            "X-RequestDigest": digest,
+        }
 
-        r = http_requests.post(url, headers=headers, json=body, timeout=20)
+        r = session.post(list_url, headers=headers,
+                         data=json.dumps(item_data), timeout=20)
         r.raise_for_status()
-        print(f"[SP] Demand saved to SharePoint: {payload.get('Demand ID')} | Status: {r.status_code}")
+        print(f"[SP] Saved to SharePoint: {payload.get('Demand ID')} | HTTP {r.status_code}")
         return True
 
     except Exception as e:
