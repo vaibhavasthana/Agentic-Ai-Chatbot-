@@ -14,7 +14,6 @@ load_dotenv()
 
 from flask import Flask, request, jsonify, render_template_string, send_file
 import os, json, re
-import requests as http_requests
 from io import BytesIO
 from datetime import datetime
 from google import genai
@@ -41,140 +40,155 @@ if not GEMINI_API_KEY:
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # =========================================================
-# SHAREPOINT CONFIGURATION
-# Uses SharePoint REST API with username/password authentication.
-# No admin consent required — works with any SharePoint user account.
+# AZURE SQL DATABASE CONFIGURATION
+# Stores every completed demand permanently.
+# All values loaded from Render environment variables.
 # =========================================================
 
-SP_SITE_URL  = os.getenv("SHAREPOINT_SITE_URL")   # e.g. https://associatesscit0.sharepoint.com/sites/DemandChatbot
-SP_USERNAME  = os.getenv("SHAREPOINT_USERNAME")    # your Microsoft login email
-SP_PASSWORD  = os.getenv("SHAREPOINT_PASSWORD")    # your Microsoft login password
-SP_LIST_NAME = os.getenv("SHAREPOINT_LIST_NAME", "DemandRequests")
-
-_sp_digest_cache = {"digest": None, "expires_at": 0}
+AZURE_SQL_SERVER   = os.getenv("AZURE_SQL_SERVER")    # demandchatbot-server.database.windows.net
+AZURE_SQL_DATABASE = os.getenv("AZURE_SQL_DATABASE")  # free-sql-db-8886126
+AZURE_SQL_USERNAME = os.getenv("AZURE_SQL_USERNAME")  # Sites.ReadWrite.All
+AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")  # your password
 
 
-def get_sp_request_digest() -> tuple:
+def get_db_connection():
     """
-    Gets a SharePoint Form Digest value for REST API authentication.
-    Uses username/password — no admin consent needed.
-    Returns (cookies, digest_value).
+    Creates and returns an Azure SQL Database connection using pyodbc.
+    Uses environment variables — never hardcoded credentials.
     """
-    import time
-    # Step 1: Sign in and get session cookies
-    signin_url = "https://login.microsoftonline.com/extSTS.srf"
-    signin_body = f"""<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
-      xmlns:a="http://www.w3.org/2005/08/addressing"
-      xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
-  <s:Header>
-    <a:Action s:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2005/02/trust/RST/Issue</a:Action>
-    <a:To s:mustUnderstand="1">https://login.microsoftonline.com/extSTS.srf</a:To>
-  </s:Header>
-  <s:Body>
-    <t:RequestSecurityToken xmlns:t="http://schemas.xmlsoap.org/ws/2005/02/trust">
-      <wsp:AppliesTo xmlns:wsp="http://schemas.xmlsoap.org/ws/2004/09/policy">
-        <a:EndpointReference><a:Address>{SP_SITE_URL}</a:Address></a:EndpointReference>
-      </wsp:AppliesTo>
-      <t:KeyType>http://schemas.xmlsoap.org/ws/2005/05/identity/NoProofKey</t:KeyType>
-      <t:RequestType>http://schemas.xmlsoap.org/ws/2005/02/trust/Issue</t:RequestType>
-      <t:TokenType>urn:ietf:params:oauth:token-type:jwt</t:TokenType>
-      <o:UsernameToken xmlns:o="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-        <o:Username>{SP_USERNAME}</o:Username>
-        <o:Password>{SP_PASSWORD}</o:Password>
-      </o:UsernameToken>
-    </t:RequestSecurityToken>
-  </s:Body>
-</s:Envelope>"""
-
-    r1 = http_requests.post(signin_url, data=signin_body,
-                            headers={"Content-Type": "application/soap+xml; charset=utf-8"},
-                            timeout=20)
-
-    # Extract security token
-    token_match = re.search(r"<wsse:BinarySecurityToken[^>]*>(.*?)</wsse:BinarySecurityToken>",
-                            r1.text, re.DOTALL)
-    if not token_match:
-        raise ValueError("Could not extract security token from Microsoft login")
-    security_token = token_match.group(1)
-
-    # Step 2: Get SharePoint session cookie
-    session = http_requests.Session()
-    sts_url = SP_SITE_URL.rstrip("/") + "/_forms/default.aspx?wa=wsignin1.0"
-    r2 = session.post(sts_url, data=security_token,
-                      headers={"Content-Type": "application/x-www-form-urlencoded"},
-                      timeout=20, allow_redirects=True)
-
-    # Step 3: Get form digest
-    digest_url = SP_SITE_URL.rstrip("/") + "/_api/contextinfo"
-    r3 = session.post(digest_url,
-                      headers={"Accept": "application/json;odata=verbose"},
-                      timeout=20)
-    r3.raise_for_status()
-    digest = r3.json()["d"]["GetContextWebInformation"]["FormDigestValue"]
-    return session, digest
+    import pyodbc
+    conn_str = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={AZURE_SQL_SERVER},1433;"
+        f"DATABASE={AZURE_SQL_DATABASE};"
+        f"UID={AZURE_SQL_USERNAME};"
+        f"PWD={AZURE_SQL_PASSWORD};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+        "Connection Timeout=30;"
+    )
+    return pyodbc.connect(conn_str)
 
 
-def save_to_sharepoint(payload: dict) -> bool:
+def ensure_table_exists():
     """
-    Writes the completed demand payload as a new item in the SharePoint List
-    using SharePoint REST API with username/password authentication.
-    No admin consent or app registration needed.
-    Returns True on success, False on failure (app continues regardless).
+    Creates the DemandRequests table if it doesn't already exist.
+    Called once on first save — safe to call multiple times.
     """
-    if not all([SP_SITE_URL, SP_USERNAME, SP_PASSWORD]):
-        print("[SP] SharePoint credentials not configured — skipping save")
+    create_sql = """
+    IF NOT EXISTS (
+        SELECT * FROM sysobjects
+        WHERE name='DemandRequests' AND xtype='U'
+    )
+    CREATE TABLE DemandRequests (
+        id                        INT IDENTITY(1,1) PRIMARY KEY,
+        Demand_ID                 NVARCHAR(50),
+        Demand_Timestamp          NVARCHAR(50),
+        Demand_Status             NVARCHAR(50),
+        Submission_Type           NVARCHAR(50),
+        Demand_Route              NVARCHAR(200),
+        Demand_Title              NVARCHAR(200),
+        Requirement_Summary       NVARCHAR(MAX),
+        Rationale_And_Purpose     NVARCHAR(MAX),
+        Acceptance_Criteria       NVARCHAR(MAX),
+        Business_Benefits         NVARCHAR(MAX),
+        Business_Process          NVARCHAR(200),
+        E2E_Process_In_GPM        NVARCHAR(200),
+        Application               NVARCHAR(200),
+        Landscape_Impacted        NVARCHAR(200),
+        Area                      NVARCHAR(200),
+        Requesting_Countries      NVARCHAR(200),
+        Requesting_Regions        NVARCHAR(200),
+        Bill2Country              NVARCHAR(200),
+        Target_Go_Live_Date       NVARCHAR(100),
+        Risks_If_Not_Implemented  NVARCHAR(MAX),
+        Month_End_Dependency      NVARCHAR(100),
+        Legal_Fiscal_Change       NVARCHAR(100),
+        Audit_Requirement         NVARCHAR(100),
+        GTS_Impact                NVARCHAR(100),
+        Impacted_Business_Groups  NVARCHAR(200),
+        Requesting_BU             NVARCHAR(200),
+        Potential_Savings         NVARCHAR(200),
+        Created_At                DATETIME DEFAULT GETDATE()
+    )
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(create_sql)
+        conn.commit()
+        conn.close()
+        print("[DB] Table DemandRequests ready")
+    except Exception as e:
+        print(f"[DB] Table creation error: {type(e).__name__}: {e}")
+
+
+def save_to_db(payload: dict) -> bool:
+    """
+    Saves the completed demand payload to Azure SQL Database.
+    Auto-creates the table on first run if it doesn't exist.
+    Returns True on success, False on failure — app continues regardless.
+    """
+    if not all([AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD]):
+        print("[DB] Azure SQL credentials not configured — skipping save")
         return False
 
     try:
-        session, digest = get_sp_request_digest()
+        ensure_table_exists()
+        conn   = get_db_connection()
+        cursor = conn.cursor()
 
-        # Map payload keys to SharePoint column internal names
-        item_data = {
-            "__metadata": {"type": f"SP.Data.{SP_LIST_NAME}ListItem"},
-            "Demand_ID":               payload.get("Demand ID", ""),
-            "Demand_Timestamp":        payload.get("Demand Timestamp", ""),
-            "Demand_Status":           payload.get("Demand Status", "New"),
-            "Submission_Type":         payload.get("SubmissionType", "Chatbot"),
-            "Demand_Route":            payload.get("Demand_route", ""),
-            "Demand_Title":            payload.get("Demand Title", ""),
-            "Requirement_Summary":     payload.get("Requirement summary", ""),
-            "Rationale_And_Purpose":   payload.get("Rationale and Purpose", ""),
-            "Acceptance_Criteria":     payload.get("Acceptance Criteria", ""),
-            "Business_Benefits":       payload.get("Business Benefits", ""),
-            "Business_Process":        payload.get("Business_Process", ""),
-            "E2E_Process_In_GPM":      payload.get("E2E process in GPM", ""),
-            "Application":             payload.get("Application", ""),
-            "Landscape_Impacted":      payload.get("Landscape Impacted", ""),
-            "Area":                    payload.get("Area", ""),
-            "Requesting_Countries":    payload.get("Requesting Countries", ""),
-            "Requesting_Regions":      payload.get("Requesting Regions", ""),
-            "Bill2Country":            payload.get("Bill2Country", ""),
-            "Target_Go_Live_Date":     payload.get("Target Go Live Date", ""),
-            "Risks_If_Not_Implemented":payload.get("Risks if not implemented on Target date", ""),
-            "Month_End_Dependency":    payload.get("Does this have any month-end (/Year-end) dependency?", ""),
-            "Legal_Fiscal_Change":     payload.get("Is this a legal/fiscal change?", ""),
-            "Audit_Requirement":       payload.get("Is Audit requirement", ""),
-            "GTS_Impact":              payload.get("GTS Impact", ""),
-            "Impacted_Business_Groups":payload.get("Impacted business groups", ""),
-            "Requesting_BU":           payload.get("Requesting BU", ""),
-            "Potential_Savings":       payload.get("Potential_savings", ""),
-        }
+        insert_sql = """
+        INSERT INTO DemandRequests (
+            Demand_ID, Demand_Timestamp, Demand_Status, Submission_Type,
+            Demand_Route, Demand_Title, Requirement_Summary, Rationale_And_Purpose,
+            Acceptance_Criteria, Business_Benefits, Business_Process, E2E_Process_In_GPM,
+            Application, Landscape_Impacted, Area, Requesting_Countries,
+            Requesting_Regions, Bill2Country, Target_Go_Live_Date,
+            Risks_If_Not_Implemented, Month_End_Dependency, Legal_Fiscal_Change,
+            Audit_Requirement, GTS_Impact, Impacted_Business_Groups,
+            Requesting_BU, Potential_Savings
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """
 
-        list_url = f"{SP_SITE_URL.rstrip('/')}/_api/web/lists/getbytitle('{SP_LIST_NAME}')/items"
-        headers = {
-            "Accept":          "application/json;odata=verbose",
-            "Content-Type":    "application/json;odata=verbose",
-            "X-RequestDigest": digest,
-        }
+        values = (
+            payload.get("Demand ID", ""),
+            payload.get("Demand Timestamp", ""),
+            payload.get("Demand Status", "New"),
+            payload.get("SubmissionType", "Chatbot"),
+            payload.get("Demand_route", ""),
+            payload.get("Demand Title", ""),
+            payload.get("Requirement summary", ""),
+            payload.get("Rationale and Purpose", ""),
+            payload.get("Acceptance Criteria", ""),
+            payload.get("Business Benefits", ""),
+            payload.get("Business_Process", ""),
+            payload.get("E2E process in GPM", ""),
+            payload.get("Application", ""),
+            payload.get("Landscape Impacted", ""),
+            payload.get("Area", ""),
+            payload.get("Requesting Countries", ""),
+            payload.get("Requesting Regions", ""),
+            payload.get("Bill2Country", ""),
+            payload.get("Target Go Live Date", ""),
+            payload.get("Risks if not implemented on Target date", ""),
+            payload.get("Does this have any month-end (/Year-end) dependency?", ""),
+            payload.get("Is this a legal/fiscal change?", ""),
+            payload.get("Is Audit requirement", ""),
+            payload.get("GTS Impact", ""),
+            payload.get("Impacted business groups", ""),
+            payload.get("Requesting BU", ""),
+            payload.get("Potential_savings", ""),
+        )
 
-        r = session.post(list_url, headers=headers,
-                         data=json.dumps(item_data), timeout=20)
-        r.raise_for_status()
-        print(f"[SP] Saved to SharePoint: {payload.get('Demand ID')} | HTTP {r.status_code}")
+        cursor.execute(insert_sql, values)
+        conn.commit()
+        conn.close()
+        print(f"[DB] Saved to Azure SQL: {payload.get('Demand ID')}")
         return True
 
     except Exception as e:
-        print(f"[SP] Failed to save to SharePoint: {type(e).__name__}: {e}")
+        print(f"[DB] Failed to save: {type(e).__name__}: {e}")
         return False
 
 
@@ -794,8 +808,8 @@ def chat():
 
     session_state["last_payload"] = final
 
-    # Save to SharePoint List (non-blocking — app works even if this fails)
-    sp_saved = save_to_sharepoint(final)
+    # Save to Azure SQL Database (non-blocking — app works even if this fails)
+    db_saved = save_to_db(final)
 
     auto = {
         "Requesting Regions":   final.get("Requesting Regions"),
@@ -805,7 +819,7 @@ def chat():
     reset_session()
     return jsonify({
         "status":              "All mandatory fields captured successfully!",
-        "sharepoint_saved":    sp_saved,
+        "db_saved":            db_saved,
         "auto_populated":      auto,
         "demand_id":           final["Demand ID"],
         "demand_timestamp":    final["Demand Timestamp"],
