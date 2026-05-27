@@ -70,8 +70,14 @@ def get_db_engine():
     try:
         from urllib.parse import quote_plus
         pwd = quote_plus(AZURE_SQL_PASSWORD)
+        # Azure SQL requires user@servershortname format for login
+        # Extract short server name (strip .database.windows.net)
+        server_short = AZURE_SQL_SERVER.split(".")[0]
+        login = f"{AZURE_SQL_USERNAME}@{server_short}"
+        login_encoded = quote_plus(login)
+
         url = (
-            f"mssql+pymssql://{AZURE_SQL_USERNAME}:{pwd}"
+            f"mssql+pymssql://{login_encoded}:{pwd}"
             f"@{AZURE_SQL_SERVER}/{AZURE_SQL_DATABASE}"
         )
         _db_engine = sa.create_engine(
@@ -83,7 +89,7 @@ def get_db_engine():
         # Verify connection works at startup
         with _db_engine.connect() as conn:
             conn.execute(sa.text("SELECT 1"))
-        print("[DB] SQLAlchemy engine created (pymssql) — connected successfully")
+        print(f"[DB] SQLAlchemy engine created (pymssql) — connected as {login}")
         return _db_engine
     except Exception as e:
         print(f"[DB] Connection failed: {type(e).__name__}: {e}")
