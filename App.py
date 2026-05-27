@@ -57,26 +57,37 @@ _db_engine = None
 
 def get_db_engine():
     """
-    Returns a cached SQLAlchemy engine using pymssql dialect.
-    pymssql ships as a pre-built wheel — no ODBC/C drivers needed on Render.
-    Connection string format: mssql+pymssql://user:pass@server/database
+    Returns a cached SQLAlchemy engine using pyodbc dialect with ODBC Driver 18.
+    pyodbc is a pure-Python wrapper that uses the system ODBC driver.
+    On Render, ODBC Driver 17/18 for SQL Server is pre-installed on Linux.
+    Connection string format: mssql+pyodbc://user:pass@server/database?driver=...
     """
     global _db_engine
     if _db_engine is not None:
         return _db_engine
     if not all([AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD]):
         return None
-    # URL-encode password to handle special characters safely
     from urllib.parse import quote_plus
     pwd = quote_plus(AZURE_SQL_PASSWORD)
-    url = (
-        f"mssql+pymssql://{AZURE_SQL_USERNAME}:{pwd}"
-        f"@{AZURE_SQL_SERVER}/{AZURE_SQL_DATABASE}"
-    )
-    _db_engine = sa.create_engine(url, pool_pre_ping=True, pool_recycle=300,
-                                   connect_args={"login_timeout": 30})
-    print("[DB] SQLAlchemy engine created (pymssql)")
-    return _db_engine
+    # Try ODBC Driver 18 first, fall back to 17
+    for driver in ["ODBC+Driver+18+for+SQL+Server", "ODBC+Driver+17+for+SQL+Server"]:
+        try:
+            url = (
+                f"mssql+pyodbc://{AZURE_SQL_USERNAME}:{pwd}"
+                f"@{AZURE_SQL_SERVER}/{AZURE_SQL_DATABASE}"
+                f"?driver={driver}&Encrypt=yes&TrustServerCertificate=no&Connection+Timeout=30"
+            )
+            engine = sa.create_engine(url, pool_pre_ping=True, pool_recycle=300)
+            # Test connection immediately
+            with engine.connect() as conn:
+                conn.execute(sa.text("SELECT 1"))
+            _db_engine = engine
+            print(f"[DB] SQLAlchemy engine created (pyodbc / {driver.replace('+', ' ')})")
+            return _db_engine
+        except Exception as e:
+            print(f"[DB] Driver {driver} failed: {e}")
+    print("[DB] All ODBC drivers failed — DB writes disabled")
+    return None
 
 
 def ensure_table_exists():
