@@ -53,21 +53,21 @@ AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")  # your password
 
 def get_db_connection():
     """
-    Creates and returns an Azure SQL Database connection using pyodbc.
+    Creates and returns an Azure SQL Database connection using pymssql.
+    pymssql works on Render without needing ODBC drivers installed.
     Uses environment variables — never hardcoded credentials.
     """
-    import pyodbc
-    conn_str = (
-        "DRIVER={ODBC Driver 18 for SQL Server};"
-        f"SERVER={AZURE_SQL_SERVER},1433;"
-        f"DATABASE={AZURE_SQL_DATABASE};"
-        f"UID={AZURE_SQL_USERNAME};"
-        f"PWD={AZURE_SQL_PASSWORD};"
-        "Encrypt=yes;"
-        "TrustServerCertificate=no;"
-        "Connection Timeout=30;"
+    import pymssql
+    return pymssql.connect(
+        server=AZURE_SQL_SERVER,
+        user=AZURE_SQL_USERNAME,
+        password=AZURE_SQL_PASSWORD,
+        database=AZURE_SQL_DATABASE,
+        port=1433,
+        tds_version="7.0",
+        login_timeout=30,
+        as_dict=False
     )
-    return pyodbc.connect(conn_str)
 
 
 def ensure_table_exists():
