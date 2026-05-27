@@ -52,14 +52,14 @@ AZURE_SQL_USERNAME = os.getenv("AZURE_SQL_USERNAME")  # SQL admin username
 AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")  # SQL admin password
 
 # SQLAlchemy engine — built once at startup, reused for every insert.
-# Uses pytds dialect which needs NO system ODBC drivers (Render compatible).
+# Uses pymssql dialect which ships as a pre-built wheel (Render compatible).
 _db_engine = None
 
 def get_db_engine():
     """
-    Returns a cached SQLAlchemy engine using pytds dialect.
-    pytds is pure-Python — no ODBC/C drivers needed on Render.
-    Connection string format: mssql+pytds://user:pass@server/database
+    Returns a cached SQLAlchemy engine using pymssql dialect.
+    pymssql ships as a pre-built wheel — no ODBC/C drivers needed on Render.
+    Connection string format: mssql+pymssql://user:pass@server/database
     """
     global _db_engine
     if _db_engine is not None:
@@ -70,12 +70,12 @@ def get_db_engine():
     from urllib.parse import quote_plus
     pwd = quote_plus(AZURE_SQL_PASSWORD)
     url = (
-        f"mssql+pytds://{AZURE_SQL_USERNAME}:{pwd}"
+        f"mssql+pymssql://{AZURE_SQL_USERNAME}:{pwd}"
         f"@{AZURE_SQL_SERVER}/{AZURE_SQL_DATABASE}"
-        f"?encrypt=true"
     )
-    _db_engine = sa.create_engine(url, pool_pre_ping=True, pool_recycle=300)
-    print("[DB] SQLAlchemy engine created (pytds)")
+    _db_engine = sa.create_engine(url, pool_pre_ping=True, pool_recycle=300,
+                                   connect_args={"login_timeout": 30})
+    print("[DB] SQLAlchemy engine created (pymssql)")
     return _db_engine
 
 
@@ -133,7 +133,7 @@ def ensure_table_exists():
 
 def save_to_db(payload: dict) -> bool:
     """
-    Saves the completed demand payload to Azure SQL Database via SQLAlchemy + pytds.
+    Saves the completed demand payload to Azure SQL Database via SQLAlchemy + pymssql.
     Auto-creates the table on first run if it doesn't exist.
     Returns True on success, False on failure — app continues regardless.
     """
