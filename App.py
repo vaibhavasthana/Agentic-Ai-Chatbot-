@@ -17,6 +17,7 @@ import os, json, re
 from io import BytesIO
 from datetime import datetime
 from google import genai
+import sqlalchemy as sa
 
 # reportlab imports
 from reportlab.lib.pagesizes import A4
@@ -45,49 +46,56 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # All values loaded from Render environment variables.
 # =========================================================
 
-AZURE_SQL_SERVER   = os.getenv("AZURE_SQL_SERVER")    # demandchatbot-server.database.windows.net
-AZURE_SQL_DATABASE = os.getenv("AZURE_SQL_DATABASE")  # free-sql-db-8886126
-AZURE_SQL_USERNAME = os.getenv("AZURE_SQL_USERNAME")  # Sites.ReadWrite.All
-AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")  # your password
+AZURE_SQL_SERVER   = os.getenv("AZURE_SQL_SERVER")    # e.g. demandchatbot-se.database.windows.net
+AZURE_SQL_DATABASE = os.getenv("AZURE_SQL_DATABASE")  # e.g. DemandChatbotDB
+AZURE_SQL_USERNAME = os.getenv("AZURE_SQL_USERNAME")  # SQL admin username
+AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")  # SQL admin password
 
+# SQLAlchemy engine — built once at startup, reused for every insert.
+# Uses pytds dialect which needs NO system ODBC drivers (Render compatible).
+_db_engine = None
 
-def get_db_connection():
+def get_db_engine():
     """
-    Creates and returns an Azure SQL Database connection using pymssql.
-    pymssql works on Render without needing ODBC drivers installed.
-    Uses environment variables — never hardcoded credentials.
+    Returns a cached SQLAlchemy engine using pytds dialect.
+    pytds is pure-Python — no ODBC/C drivers needed on Render.
+    Connection string format: mssql+pytds://user:pass@server/database
     """
-    import pymssql
-    return pymssql.connect(
-        server=AZURE_SQL_SERVER,
-        user=AZURE_SQL_USERNAME,
-        password=AZURE_SQL_PASSWORD,
-        database=AZURE_SQL_DATABASE,
-        port=1433,
-        tds_version="7.0",
-        login_timeout=30,
-        as_dict=False
+    global _db_engine
+    if _db_engine is not None:
+        return _db_engine
+    if not all([AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD]):
+        return None
+    # URL-encode password to handle special characters safely
+    from urllib.parse import quote_plus
+    pwd = quote_plus(AZURE_SQL_PASSWORD)
+    url = (
+        f"mssql+pytds://{AZURE_SQL_USERNAME}:{pwd}"
+        f"@{AZURE_SQL_SERVER}/{AZURE_SQL_DATABASE}"
+        f"?encrypt=true"
     )
+    _db_engine = sa.create_engine(url, pool_pre_ping=True, pool_recycle=300)
+    print("[DB] SQLAlchemy engine created (pytds)")
+    return _db_engine
 
 
 def ensure_table_exists():
     """
     Creates the DemandRequests table if it doesn't already exist.
-    Called once on first save — safe to call multiple times.
+    Called once on first save — safe to call multiple times (IF NOT EXISTS).
     """
-    create_sql = """
+    create_sql = sa.text("""
     IF NOT EXISTS (
-        SELECT * FROM sysobjects
-        WHERE name='DemandRequests' AND xtype='U'
+        SELECT * FROM sysobjects WHERE name='DemandRequests' AND xtype='U'
     )
     CREATE TABLE DemandRequests (
         id                        INT IDENTITY(1,1) PRIMARY KEY,
         Demand_ID                 NVARCHAR(50),
-        Demand_Timestamp          NVARCHAR(50),
+        Demand_Timestamp          NVARCHAR(100),
         Demand_Status             NVARCHAR(50),
         Submission_Type           NVARCHAR(50),
         Demand_Route              NVARCHAR(200),
-        Demand_Title              NVARCHAR(200),
+        Demand_Title              NVARCHAR(500),
         Requirement_Summary       NVARCHAR(MAX),
         Rationale_And_Purpose     NVARCHAR(MAX),
         Acceptance_Criteria       NVARCHAR(MAX),
@@ -111,13 +119,13 @@ def ensure_table_exists():
         Potential_Savings         NVARCHAR(200),
         Created_At                DATETIME DEFAULT GETDATE()
     )
-    """
+    """)
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(create_sql)
-        conn.commit()
-        conn.close()
+        engine = get_db_engine()
+        if engine is None:
+            return
+        with engine.begin() as conn:
+            conn.execute(create_sql)
         print("[DB] Table DemandRequests ready")
     except Exception as e:
         print(f"[DB] Table creation error: {type(e).__name__}: {e}")
@@ -125,20 +133,19 @@ def ensure_table_exists():
 
 def save_to_db(payload: dict) -> bool:
     """
-    Saves the completed demand payload to Azure SQL Database.
+    Saves the completed demand payload to Azure SQL Database via SQLAlchemy + pytds.
     Auto-creates the table on first run if it doesn't exist.
     Returns True on success, False on failure — app continues regardless.
     """
-    if not all([AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD]):
+    engine = get_db_engine()
+    if engine is None:
         print("[DB] Azure SQL credentials not configured — skipping save")
         return False
 
     try:
         ensure_table_exists()
-        conn   = get_db_connection()
-        cursor = conn.cursor()
 
-        insert_sql = """
+        insert_sql = sa.text("""
         INSERT INTO DemandRequests (
             Demand_ID, Demand_Timestamp, Demand_Status, Submission_Type,
             Demand_Route, Demand_Title, Requirement_Summary, Rationale_And_Purpose,
@@ -148,42 +155,51 @@ def save_to_db(payload: dict) -> bool:
             Risks_If_Not_Implemented, Month_End_Dependency, Legal_Fiscal_Change,
             Audit_Requirement, GTS_Impact, Impacted_Business_Groups,
             Requesting_BU, Potential_Savings
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """
-
-        values = (
-            payload.get("Demand ID", ""),
-            payload.get("Demand Timestamp", ""),
-            payload.get("Demand Status", "New"),
-            payload.get("SubmissionType", "Chatbot"),
-            payload.get("Demand_route", ""),
-            payload.get("Demand Title", ""),
-            payload.get("Requirement summary", ""),
-            payload.get("Rationale and Purpose", ""),
-            payload.get("Acceptance Criteria", ""),
-            payload.get("Business Benefits", ""),
-            payload.get("Business_Process", ""),
-            payload.get("E2E process in GPM", ""),
-            payload.get("Application", ""),
-            payload.get("Landscape Impacted", ""),
-            payload.get("Area", ""),
-            payload.get("Requesting Countries", ""),
-            payload.get("Requesting Regions", ""),
-            payload.get("Bill2Country", ""),
-            payload.get("Target Go Live Date", ""),
-            payload.get("Risks if not implemented on Target date", ""),
-            payload.get("Does this have any month-end (/Year-end) dependency?", ""),
-            payload.get("Is this a legal/fiscal change?", ""),
-            payload.get("Is Audit requirement", ""),
-            payload.get("GTS Impact", ""),
-            payload.get("Impacted business groups", ""),
-            payload.get("Requesting BU", ""),
-            payload.get("Potential_savings", ""),
+        ) VALUES (
+            :demand_id, :demand_timestamp, :demand_status, :submission_type,
+            :demand_route, :demand_title, :requirement_summary, :rationale_and_purpose,
+            :acceptance_criteria, :business_benefits, :business_process, :e2e_process,
+            :application, :landscape_impacted, :area, :requesting_countries,
+            :requesting_regions, :bill2country, :target_go_live_date,
+            :risks, :month_end_dependency, :legal_fiscal_change,
+            :audit_requirement, :gts_impact, :impacted_business_groups,
+            :requesting_bu, :potential_savings
         )
+        """)
 
-        cursor.execute(insert_sql, values)
-        conn.commit()
-        conn.close()
+        values = {
+            "demand_id":               payload.get("Demand ID", ""),
+            "demand_timestamp":        payload.get("Demand Timestamp", ""),
+            "demand_status":           payload.get("Demand Status", "New"),
+            "submission_type":         payload.get("SubmissionType", "Chatbot"),
+            "demand_route":            payload.get("Demand_route", ""),
+            "demand_title":            payload.get("Demand Title", ""),
+            "requirement_summary":     payload.get("Requirement summary", ""),
+            "rationale_and_purpose":   payload.get("Rationale and Purpose", ""),
+            "acceptance_criteria":     payload.get("Acceptance Criteria", ""),
+            "business_benefits":       payload.get("Business Benefits", ""),
+            "business_process":        payload.get("Business_Process", ""),
+            "e2e_process":             payload.get("E2E process in GPM", ""),
+            "application":             payload.get("Application", ""),
+            "landscape_impacted":      payload.get("Landscape Impacted", ""),
+            "area":                    payload.get("Area", ""),
+            "requesting_countries":    payload.get("Requesting Countries", ""),
+            "requesting_regions":      payload.get("Requesting Regions", ""),
+            "bill2country":            payload.get("Bill2Country", ""),
+            "target_go_live_date":     payload.get("Target Go Live Date", ""),
+            "risks":                   payload.get("Risks if not implemented on Target date", ""),
+            "month_end_dependency":    payload.get("Does this have any month-end (/Year-end) dependency?", ""),
+            "legal_fiscal_change":     payload.get("Is this a legal/fiscal change?", ""),
+            "audit_requirement":       payload.get("Is Audit requirement", ""),
+            "gts_impact":              payload.get("GTS Impact", ""),
+            "impacted_business_groups":payload.get("Impacted business groups", ""),
+            "requesting_bu":           payload.get("Requesting BU", ""),
+            "potential_savings":       payload.get("Potential_savings", ""),
+        }
+
+        with engine.begin() as conn:
+            conn.execute(insert_sql, values)
+
         print(f"[DB] Saved to Azure SQL: {payload.get('Demand ID')}")
         return True
 
