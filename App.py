@@ -46,50 +46,61 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # All values loaded from Render environment variables.
 # =========================================================
 
-AZURE_SQL_SERVER   = os.getenv("AZURE_SQL_SERVER")    # e.g. demandchatbot-se.database.windows.net
-AZURE_SQL_DATABASE = os.getenv("AZURE_SQL_DATABASE")  # e.g. DemandChatbotDB
-AZURE_SQL_USERNAME = os.getenv("AZURE_SQL_USERNAME")  # SQL admin username
-AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")  # SQL admin password
-
-# SQLAlchemy engine — built once at startup, reused for every insert.
-# Uses pymssql dialect which ships as a pre-built wheel (Render compatible).
+# NOTE: Azure SQL credentials are intentionally NOT read at module level.
+# They are read fresh inside get_db_engine() on every cold start so that
+# Render's injected environment variables are always available.
 _db_engine = None
 
 def get_db_engine():
     """
     Returns a cached SQLAlchemy engine using pymssql dialect.
-    pymssql connects directly via TDS protocol — zero OS-level drivers needed.
-    Works on Render out of the box with Python 3.11 (pre-built wheel available).
-    Connection string: mssql+pymssql://user:pass@server/database
+    Credentials are read fresh from os.environ on every cold start.
+    pymssql connects directly via TDS — zero OS-level drivers needed.
     """
     global _db_engine
     if _db_engine is not None:
         return _db_engine
-    if not all([AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD]):
+
+    # Read credentials fresh at call time (not module load time)
+    server   = os.environ.get("AZURE_SQL_SERVER", "").strip()
+    database = os.environ.get("AZURE_SQL_DATABASE", "").strip()
+    username = os.environ.get("AZURE_SQL_USERNAME", "").strip()
+    password = os.environ.get("AZURE_SQL_PASSWORD", "").strip()
+
+    # Debug: log which vars are present (never log values)
+    missing = [k for k, v in {
+        "AZURE_SQL_SERVER": server, "AZURE_SQL_DATABASE": database,
+        "AZURE_SQL_USERNAME": username, "AZURE_SQL_PASSWORD": password
+    }.items() if not v]
+
+    if missing:
+        print(f"[DB] Missing env vars: {missing} — skipping DB connection")
         return None
+
+    print(f"[DB] All credentials present. Server={server}, DB={database}, User={username}")
+
     try:
         from urllib.parse import quote_plus
-        pwd = quote_plus(AZURE_SQL_PASSWORD)
-        # Azure SQL requires user@servershortname format for login
-        # Extract short server name (strip .database.windows.net)
-        server_short = AZURE_SQL_SERVER.split(".")[0]
-        login = f"{AZURE_SQL_USERNAME}@{server_short}"
+        pwd = quote_plus(password)
+        # Azure SQL requires user@shortservername login format
+        server_short = server.split(".")[0]
+        login = f"{username}@{server_short}"
         login_encoded = quote_plus(login)
 
         url = (
             f"mssql+pymssql://{login_encoded}:{pwd}"
-            f"@{AZURE_SQL_SERVER}/{AZURE_SQL_DATABASE}"
+            f"@{server}/{database}"
         )
-        _db_engine = sa.create_engine(
+        engine = sa.create_engine(
             url,
             pool_pre_ping=True,
             pool_recycle=300,
             connect_args={"login_timeout": 30, "tds_version": "7.4"}
         )
-        # Verify connection works at startup
-        with _db_engine.connect() as conn:
+        with engine.connect() as conn:
             conn.execute(sa.text("SELECT 1"))
-        print(f"[DB] SQLAlchemy engine created (pymssql) — connected as {login}")
+        _db_engine = engine
+        print(f"[DB] Connected successfully as {login}")
         return _db_engine
     except Exception as e:
         print(f"[DB] Connection failed: {type(e).__name__}: {e}")
