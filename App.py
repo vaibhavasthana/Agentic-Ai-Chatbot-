@@ -42,31 +42,21 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 # =========================================================
 # AZURE SQL DATABASE CONFIGURATION
-# Stores every completed demand permanently.
-# All values loaded from Render environment variables.
 # =========================================================
 
-AZURE_SQL_SERVER   = os.getenv("AZURE_SQL_SERVER")    # e.g. demandchatbot-se.database.windows.net
-AZURE_SQL_DATABASE = os.getenv("AZURE_SQL_DATABASE")  # e.g. DemandChatbotDB
-AZURE_SQL_USERNAME = os.getenv("AZURE_SQL_USERNAME")  # SQL admin username
-AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")  # SQL admin password
+AZURE_SQL_SERVER   = (os.getenv("AZURE_SQL_SERVER")   or "").strip()
+AZURE_SQL_DATABASE = (os.getenv("AZURE_SQL_DATABASE") or "").strip()
+AZURE_SQL_USERNAME = (os.getenv("AZURE_SQL_USERNAME") or "").strip()
+AZURE_SQL_PASSWORD = (os.getenv("AZURE_SQL_PASSWORD") or "").strip()
 
-# SQLAlchemy engine — built once at startup, reused for every insert.
-# Uses pymssql dialect which ships as a pre-built wheel (Render compatible).
 _db_engine = None
 
 def get_db_engine():
-    """
-    Returns a cached SQLAlchemy engine using pymssql dialect.
-    pymssql ships as a pre-built wheel — no ODBC/C drivers needed on Render.
-    Connection string format: mssql+pymssql://user:pass@server/database
-    """
     global _db_engine
     if _db_engine is not None:
         return _db_engine
     if not all([AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD]):
         return None
-    # URL-encode password to handle special characters safely
     from urllib.parse import quote_plus
     pwd = quote_plus(AZURE_SQL_PASSWORD)
     url = (
@@ -80,10 +70,6 @@ def get_db_engine():
 
 
 def ensure_table_exists():
-    """
-    Creates the DemandRequests table if it doesn't already exist.
-    Called once on first save — safe to call multiple times (IF NOT EXISTS).
-    """
     create_sql = sa.text("""
     IF NOT EXISTS (
         SELECT * FROM sysobjects WHERE name='DemandRequests' AND xtype='U'
@@ -132,19 +118,12 @@ def ensure_table_exists():
 
 
 def save_to_db(payload: dict) -> bool:
-    """
-    Saves the completed demand payload to Azure SQL Database via SQLAlchemy + pymssql.
-    Auto-creates the table on first run if it doesn't exist.
-    Returns True on success, False on failure — app continues regardless.
-    """
     engine = get_db_engine()
     if engine is None:
         print("[DB] Azure SQL credentials not configured — skipping save")
         return False
-
     try:
         ensure_table_exists()
-
         insert_sql = sa.text("""
         INSERT INTO DemandRequests (
             Demand_ID, Demand_Timestamp, Demand_Status, Submission_Type,
@@ -166,7 +145,6 @@ def save_to_db(payload: dict) -> bool:
             :requesting_bu, :potential_savings
         )
         """)
-
         values = {
             "demand_id":               payload.get("Demand ID", ""),
             "demand_timestamp":        payload.get("Demand Timestamp", ""),
@@ -196,13 +174,10 @@ def save_to_db(payload: dict) -> bool:
             "requesting_bu":           payload.get("Requesting BU", ""),
             "potential_savings":       payload.get("Potential_savings", ""),
         }
-
         with engine.begin() as conn:
             conn.execute(insert_sql, values)
-
         print(f"[DB] Saved to Azure SQL: {payload.get('Demand ID')}")
         return True
-
     except Exception as e:
         print(f"[DB] Failed to save: {type(e).__name__}: {e}")
         return False
@@ -243,11 +218,6 @@ _demand_counter = 0
 
 
 def generate_demand_id() -> str:
-    """
-    Auto-generates a unique Demand ID. Format: YYMM_DEMO####
-    e.g. 2605_DEMO0001 = first demand created in May 2026 (IST)
-    Acts as primary key for each BRD / demand record.
-    """
     global _demand_counter
     _demand_counter += 1
     from datetime import timezone, timedelta
@@ -257,10 +227,6 @@ def generate_demand_id() -> str:
 
 
 def generate_timestamp() -> str:
-    """
-    Records the exact moment the demand was submitted in IST (UTC+5:30).
-    Format: DD-Mon-YYYY HH:MM AM/PM IST  e.g. 07-May-2026 10:45 AM IST
-    """
     from datetime import timezone, timedelta
     IST = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(IST).strftime("%d-%b-%Y %I:%M %p") + " IST"
@@ -280,15 +246,10 @@ def get_next_field():
 
 # =========================================================
 # ENTERPRISE REGION MAP
-# The ONLY hardcoded element — maps sovereign country names
-# to enterprise business regions. Gemini resolves location → country.
-# Python maps country → region deterministically (zero tokens).
 # =========================================================
 
 COUNTRY_TO_REGION = {
-    # North America
     "United States": "North America", "Canada": "North America", "Mexico": "North America",
-    # Europe
     "United Kingdom": "Europe", "Germany": "Europe", "France": "Europe", "Italy": "Europe",
     "Spain": "Europe", "Netherlands": "Europe", "Poland": "Europe", "Switzerland": "Europe",
     "Sweden": "Europe", "Norway": "Europe", "Denmark": "Europe", "Finland": "Europe",
@@ -301,7 +262,6 @@ COUNTRY_TO_REGION = {
     "Belarus": "Europe", "Moldova": "Europe", "Kosovo": "Europe", "Montenegro": "Europe",
     "Cyprus": "Europe", "Malta": "Europe", "Iceland": "Europe", "Liechtenstein": "Europe",
     "Monaco": "Europe", "San Marino": "Europe", "Andorra": "Europe",
-    # Asia-South Pacific
     "India": "Asia-South Pacific", "Australia": "Asia-South Pacific",
     "New Zealand": "Asia-South Pacific", "Singapore": "Asia-South Pacific",
     "Malaysia": "Asia-South Pacific", "Indonesia": "Asia-South Pacific",
@@ -319,7 +279,6 @@ COUNTRY_TO_REGION = {
     "Marshall Islands": "Asia-South Pacific", "Palau": "Asia-South Pacific",
     "Nauru": "Asia-South Pacific", "Tuvalu": "Asia-South Pacific",
     "Afghanistan": "Asia-South Pacific",
-    # Middle East & Africa
     "Egypt": "Middle East & Africa", "United Arab Emirates": "Middle East & Africa",
     "Saudi Arabia": "Middle East & Africa", "Nigeria": "Middle East & Africa",
     "Kenya": "Middle East & Africa", "South Africa": "Middle East & Africa",
@@ -355,7 +314,6 @@ COUNTRY_TO_REGION = {
     "Cape Verde": "Middle East & Africa", "Sao Tome and Principe": "Middle East & Africa",
     "Guinea-Bissau": "Middle East & Africa", "Gambia": "Middle East & Africa",
     "Mauritania": "Middle East & Africa",
-    # Latin America
     "Brazil": "Latin America", "Argentina": "Latin America", "Chile": "Latin America",
     "Colombia": "Latin America", "Peru": "Latin America", "Ecuador": "Latin America",
     "Venezuela": "Latin America", "Uruguay": "Latin America", "Paraguay": "Latin America",
@@ -370,41 +328,24 @@ COUNTRY_TO_REGION = {
     "Saint Vincent and the Grenadines": "Latin America",
     "Antigua and Barbuda": "Latin America", "Dominica": "Latin America",
     "Saint Kitts and Nevis": "Latin America",
-    # China
     "China": "China", "Hong Kong": "China", "Macau": "China",
-    # North Asia
     "Japan": "North Asia", "South Korea": "North Asia", "Taiwan": "North Asia",
     "Mongolia": "North Asia", "North Korea": "North Asia",
-    # Global
     "Global": "Global",
 }
 
 
 # =========================================================
-# GEO INFERENCE — 100% Gemini powered, zero hardcoded lookups
-# Gemini resolves ANY location input (city/village/town/street/
-# district/state/country) to a sovereign country using its
-# built-in world knowledge and chain-of-thought reasoning.
+# GEO INFERENCE — Gemini powered
+# FIX: Updated model name from deprecated gemini-2.5-flash-preview-05-20
+#      to gemini-2.0-flash which is stable and available.
 # =========================================================
 
+GEMINI_MODEL = "gemini-2.5-flash"
+
 def infer_geo_from_area(area: str) -> dict:
-    """
-    Fully Gemini-powered geo resolution. No hardcoded city/state lists.
-
-    Call 1 — PRIMARY: chain-of-thought prompt asking Gemini to reason
-              step by step before returning a country. Works for Tier 1/2/3
-              cities, villages, streets, districts — anything.
-
-    Call 2 — RECOVERY: fires only if Call 1 returns something not in
-              COUNTRY_TO_REGION. Gives Gemini a second chance with a
-              more explicit focused prompt.
-
-    Fallback — only if BOTH Gemini calls fail due to network/API issues.
-               Returns area as-is with Global region. Never crashes the app.
-    """
     area_clean = area.strip()
 
-    # ── CALL 1: PRIMARY — chain-of-thought reasoning ───────────────────────
     prompt_1 = (
         "You are a world geography expert with complete knowledge of every city, "
         "town, village, district, street, neighbourhood, state, and country on Earth.\n\n"
@@ -427,6 +368,7 @@ def infer_geo_from_area(area: str) -> dict:
         "Ribeirao Preto → {reasoning: city in Sao Paulo state, country: Brazil}\n"
         "Onitsha → {reasoning: city in Anambra state, country: Nigeria}\n"
         "Multan → {reasoning: city in Punjab province, country: Pakistan}\n"
+        "Seoul → {reasoning: capital city of South Korea, country: South Korea}\n"
         "Antananarivo → {reasoning: capital of Madagascar, country: Madagascar}\n"
         "Guadalajara → {reasoning: city in Jalisco state, country: Mexico}\n"
         "Chengdu → {reasoning: city in Sichuan province, country: China}\n"
@@ -441,7 +383,7 @@ def infer_geo_from_area(area: str) -> dict:
 
     country = None
     try:
-        r1      = client.models.generate_content(model="gemini-2.5-flash-preview-05-20", contents=prompt_1)
+        r1      = client.models.generate_content(model=GEMINI_MODEL, contents=prompt_1)
         raw     = r1.text.strip()
         raw     = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
         match   = re.search(r'\{.*?\}', raw, re.DOTALL)
@@ -455,7 +397,6 @@ def infer_geo_from_area(area: str) -> dict:
             print(f"[GEO] Resolved: {country} → {region}")
             return {"Requesting Countries": country, "Requesting Regions": region, "Bill2Country": country}
 
-        # Country returned but not in our map — still valid, just use Global for region
         if country and country not in ("", "Global"):
             print(f"[GEO] Country '{country}' not in region map — returning with Global region")
             return {"Requesting Countries": country, "Requesting Regions": "Global", "Bill2Country": country}
@@ -465,23 +406,19 @@ def infer_geo_from_area(area: str) -> dict:
         print(f"[GEO] Call 1 failed: {type(e).__name__}: {e}")
         print(f"[GEO] Call 1 traceback: {traceback.format_exc()}")
 
-    # ── CALL 2: RECOVERY — focused retry when Call 1 gives wrong result ────
     print(f"[GEO] Call 2 Recovery triggered for: '{area_clean}'")
     prompt_2 = (
         "Geography question. Give a one-word or short-phrase answer only.\n\n"
         "Location: \"" + area_clean + "\"\n\n"
-        "This could be a small village, minor town, district, neighbourhood, "
-        "street, or any lesser-known place anywhere in the world.\n\n"
         "What is the SOVEREIGN COUNTRY this location belongs to?\n\n"
         "Rules:\n"
         "- Return the COUNTRY name only — not city, not state, not district\n"
-        "- Full English name (e.g. United States, not USA)\n"
-        "- Use linguistic, cultural, or regional context if needed\n\n"
+        "- Full English name (e.g. United States, not USA)\n\n"
         "Return ONLY this JSON:\n"
         "{\"country\": \"<country name>\"}"
     )
     try:
-        r2      = client.models.generate_content(model="gemini-2.5-flash-preview-05-20", contents=prompt_2)
+        r2      = client.models.generate_content(model=GEMINI_MODEL, contents=prompt_2)
         raw2    = r2.text.strip()
         raw2    = re.sub(r"```[a-zA-Z]*", "", raw2).replace("```", "").strip()
         match2  = re.search(r'\{.*?\}', raw2, re.DOTALL)
@@ -503,7 +440,6 @@ def infer_geo_from_area(area: str) -> dict:
         print(f"[GEO] Call 2 Recovery failed: {type(e).__name__}: {e}")
         print(f"[GEO] Call 2 traceback: {traceback.format_exc()}")
 
-    # ── FALLBACK — only if BOTH Gemini calls fail (network/API issue) ──────
     print(f"[GEO] Both Gemini calls failed for '{area_clean}' — using safe fallback")
     return {
         "Requesting Countries": area_clean.title(),
@@ -567,32 +503,31 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
     )
     styles = getSampleStyleSheet()
 
-    style_title = ParagraphStyle("DT", parent=styles["Normal"],
+    style_title    = ParagraphStyle("DT", parent=styles["Normal"],
         fontName="Helvetica-Bold", fontSize=20, textColor=WHITE, alignment=TA_CENTER, spaceAfter=2)
     style_subtitle = ParagraphStyle("DS", parent=styles["Normal"],
         fontName="Helvetica", fontSize=8.5, textColor=colors.HexColor("#93C5FD"), alignment=TA_CENTER)
     style_demandid = ParagraphStyle("DID", parent=styles["Normal"],
         fontName="Helvetica-Bold", fontSize=10, textColor=colors.HexColor("#FDE68A"), alignment=TA_CENTER)
-    style_section = ParagraphStyle("SH", parent=styles["Normal"],
+    style_section  = ParagraphStyle("SH", parent=styles["Normal"],
         fontName="Helvetica-Bold", fontSize=10, textColor=WHITE)
-    style_label = ParagraphStyle("FL", parent=styles["Normal"],
+    style_label    = ParagraphStyle("FL", parent=styles["Normal"],
         fontName="Helvetica-Bold", fontSize=8.5, textColor=MUTED, spaceAfter=1)
-    style_value = ParagraphStyle("FV", parent=styles["Normal"],
+    style_value    = ParagraphStyle("FV", parent=styles["Normal"],
         fontName="Helvetica", fontSize=9.5, textColor=DARK_TEXT, leading=13)
-    style_auto = ParagraphStyle("AV", parent=styles["Normal"],
+    style_auto     = ParagraphStyle("AV", parent=styles["Normal"],
         fontName="Helvetica-Bold", fontSize=9.5, textColor=PURPLE_TXT, leading=13)
-    style_sys = ParagraphStyle("SV", parent=styles["Normal"],
+    style_sys      = ParagraphStyle("SV", parent=styles["Normal"],
         fontName="Helvetica-Bold", fontSize=9.5, textColor=TEAL_TXT, leading=13)
-    style_footer = ParagraphStyle("FT", parent=styles["Normal"],
+    style_footer   = ParagraphStyle("FT", parent=styles["Normal"],
         fontName="Helvetica", fontSize=7.5, textColor=MUTED, alignment=TA_CENTER)
 
     story = []
 
-    demand_id   = payload.get("Demand ID", "N/A")
-    timestamp   = payload.get("Demand Timestamp", "N/A")
-    demand_title= payload.get("Demand Title", "Demand Request")
+    demand_id    = payload.get("Demand ID", "N/A")
+    timestamp    = payload.get("Demand Timestamp", "N/A")
+    demand_title = payload.get("Demand Title", "Demand Request")
 
-    # Header banner
     header_data = [
         [Paragraph("DEMAND CREATION REQUEST", style_title)],
         [Paragraph(f"Demand ID: {demand_id}", style_demandid)],
@@ -616,7 +551,6 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
     story.append(header_table)
     story.append(Spacer(1, 4*mm))
 
-    # Demand title card
     title_card = Table(
         [[Paragraph(f"<b>{demand_title}</b>", ParagraphStyle("TC",
             fontName="Helvetica-Bold", fontSize=13, textColor=NAVY, alignment=TA_CENTER))]],
@@ -653,7 +587,7 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
         field_rows = []
         i = 0
         while i < len(keys):
-            key = keys[i]
+            key   = keys[i]
             value = payload.get(key)
             if not value:
                 i += 1
@@ -690,14 +624,14 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
                     nis_sys  = next_key in SYSTEM_KEYS
                     nl_p     = Paragraph(next_key.replace("_", " ").upper(), style_label)
                     if nis_auto:
-                        nv_p   = Paragraph(f"&#9733; {nv}  <font size='7' color='#7C3AED'>[Auto]</font>", style_auto)
-                        nbg    = PURPLE_BG
+                        nv_p = Paragraph(f"&#9733; {nv}  <font size='7' color='#7C3AED'>[Auto]</font>", style_auto)
+                        nbg  = PURPLE_BG
                     elif nis_sys:
-                        nv_p   = Paragraph(f"&#128273; {nv}", style_sys)
-                        nbg    = TEAL_BG
+                        nv_p = Paragraph(f"&#128273; {nv}", style_sys)
+                        nbg  = TEAL_BG
                     else:
-                        nv_p   = Paragraph(str(nv), style_value)
-                        nbg    = LIGHT_BG
+                        nv_p = Paragraph(str(nv), style_value)
+                        nbg  = LIGHT_BG
                     field_rows.append(("pair", label_p, val_p, cell_bg, nl_p, nv_p, nbg))
                     i = j + 1
                 else:
@@ -733,9 +667,9 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
                 ri += 1
                 tbl_data.append([vp, nvp])
                 tbl_styles += [
-                    ("BACKGROUND",   (0,ri),(0,ri), bg),
-                    ("BACKGROUND",   (1,ri),(1,ri), nbg),
-                    ("TOPPADDING",   (0,ri),(1,ri), 1),
+                    ("BACKGROUND", (0,ri),(0,ri), bg),
+                    ("BACKGROUND", (1,ri),(1,ri), nbg),
+                    ("TOPPADDING", (0,ri),(1,ri), 1),
                 ]
             ri += 1
 
@@ -753,7 +687,7 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
     story.append(Spacer(1, 2*mm))
     story.append(Paragraph(
         f"Demand ID: {demand_id}  |  Recorded: {timestamp}  |  "
-        f"Auto-generated by Demand Creation Chatbot powered by Gemini 2.5 Flash",
+        f"Auto-generated by Demand Creation Chatbot powered by Gemini",
         style_footer
     ))
 
@@ -816,19 +750,17 @@ def chat():
             "progress":       f"{answered + 1} of {total}"
         })
 
-    # ── All fields captured — build final payload ──────────────────────────
     final = dict(session_state["captured"])
     final["Demand Status"]    = "New"
     final["SubmissionType"]   = "Chatbot"
-    final["Demand ID"]        = generate_demand_id()     # e.g. 2605_DEMO0001
-    final["Demand Timestamp"] = generate_timestamp()     # e.g. 07-May-2026 10:45 AM
+    final["Demand ID"]        = generate_demand_id()
+    final["Demand Timestamp"] = generate_timestamp()
 
     if "Requesting BU" in final and "Area" in final:
         final["Demand_route"] = f"{final['Requesting BU']} - {final['Area']}"
 
     session_state["last_payload"] = final
 
-    # Save to Azure SQL Database (non-blocking — app works even if this fails)
     db_saved = save_to_db(final)
 
     auto = {
@@ -838,11 +770,11 @@ def chat():
     }
     reset_session()
     return jsonify({
-        "status":              "All mandatory fields captured successfully!",
-        "db_saved":            db_saved,
-        "auto_populated":      auto,
-        "demand_id":           final["Demand ID"],
-        "demand_timestamp":    final["Demand Timestamp"],
+        "status":               "All mandatory fields captured successfully!",
+        "db_saved":             db_saved,
+        "auto_populated":       auto,
+        "demand_id":            final["Demand ID"],
+        "demand_timestamp":     final["Demand Timestamp"],
         "final_demand_payload": final
     })
 
@@ -969,7 +901,7 @@ def ui():
   <div class="header">
     <div class="header-left">
       <h1>&#9889; Demand Creation Chatbot</h1>
-      <p>Powered by Gemini 2.5 Flash &middot; SharePoint &amp; Google Compatible</p>
+      <p>Powered by Gemini &middot; SharePoint &amp; Google Compatible</p>
     </div>
     <button class="reset-btn" onclick="resetChat()">&#8635; Reset</button>
   </div>
@@ -1019,7 +951,6 @@ async function sendMsg(){
       lastPayload=d.final_demand_payload;
       const auto=d.auto_populated;
 
-      // Auto-populated geo callout
       addBotMsg(
         '<span class="auto-pop-tag">&#10024; Auto-populated by Gemini</span><br/>'
         +'<b>Requesting Regions:</b> '+auto['Requesting Regions']+'<br/>'
@@ -1027,7 +958,6 @@ async function sendMsg(){
         +'<b>Bill2Country:</b> '+auto['Bill2Country']
       );
 
-      // Final payload with Demand ID and Timestamp prominently shown
       setTimeout(()=>{
         addBotMsg(
           '<b>&#10003; '+d.status+'</b><br/><br/>'
