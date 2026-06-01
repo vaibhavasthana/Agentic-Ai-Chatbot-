@@ -46,66 +46,37 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # All values loaded from Render environment variables.
 # =========================================================
 
-# NOTE: Azure SQL credentials are intentionally NOT read at module level.
-# They are read fresh inside get_db_engine() on every cold start so that
-# Render's injected environment variables are always available.
+AZURE_SQL_SERVER   = os.getenv("AZURE_SQL_SERVER")    # e.g. demandchatbot-se.database.windows.net
+AZURE_SQL_DATABASE = os.getenv("AZURE_SQL_DATABASE")  # e.g. DemandChatbotDB
+AZURE_SQL_USERNAME = os.getenv("AZURE_SQL_USERNAME")  # SQL admin username
+AZURE_SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD")  # SQL admin password
+
+# SQLAlchemy engine — built once at startup, reused for every insert.
+# Uses pymssql dialect which ships as a pre-built wheel (Render compatible).
 _db_engine = None
 
 def get_db_engine():
     """
     Returns a cached SQLAlchemy engine using pymssql dialect.
-    Credentials are read fresh from os.environ on every cold start.
-    pymssql connects directly via TDS — zero OS-level drivers needed.
+    pymssql ships as a pre-built wheel — no ODBC/C drivers needed on Render.
+    Connection string format: mssql+pymssql://user:pass@server/database
     """
     global _db_engine
     if _db_engine is not None:
         return _db_engine
-
-    # Read credentials fresh at call time (not module load time)
-    server   = os.environ.get("AZURE_SQL_SERVER", "").strip()
-    database = os.environ.get("AZURE_SQL_DATABASE", "").strip()
-    username = os.environ.get("AZURE_SQL_USERNAME", "").strip()
-    password = os.environ.get("AZURE_SQL_PASSWORD", "").strip()
-
-    # Debug: log which vars are present (never log values)
-    missing = [k for k, v in {
-        "AZURE_SQL_SERVER": server, "AZURE_SQL_DATABASE": database,
-        "AZURE_SQL_USERNAME": username, "AZURE_SQL_PASSWORD": password
-    }.items() if not v]
-
-    if missing:
-        print(f"[DB] Missing env vars: {missing} — skipping DB connection")
+    if not all([AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, AZURE_SQL_PASSWORD]):
         return None
-
-    print(f"[DB] All credentials present. Server={server}, DB={database}, User={username}")
-
-    try:
-        from urllib.parse import quote_plus
-        pwd = quote_plus(password)
-        # Azure SQL requires user@shortservername login format
-        server_short = server.split(".")[0]
-        login = f"{username}@{server_short}"
-        login_encoded = quote_plus(login)
-
-        url = (
-            f"mssql+pymssql://{login_encoded}:{pwd}"
-            f"@{server}/{database}"
-        )
-        engine = sa.create_engine(
-            url,
-            pool_pre_ping=True,
-            pool_recycle=300,
-            connect_args={"login_timeout": 30, "tds_version": "7.4"}
-        )
-        with engine.connect() as conn:
-            conn.execute(sa.text("SELECT 1"))
-        _db_engine = engine
-        print(f"[DB] Connected successfully as {login}")
-        return _db_engine
-    except Exception as e:
-        print(f"[DB] Connection failed: {type(e).__name__}: {e}")
-        _db_engine = None
-        return None
+    # URL-encode password to handle special characters safely
+    from urllib.parse import quote_plus
+    pwd = quote_plus(AZURE_SQL_PASSWORD)
+    url = (
+        f"mssql+pymssql://{AZURE_SQL_USERNAME}:{pwd}"
+        f"@{AZURE_SQL_SERVER}/{AZURE_SQL_DATABASE}"
+    )
+    _db_engine = sa.create_engine(url, pool_pre_ping=True, pool_recycle=300,
+                                   connect_args={"login_timeout": 30})
+    print("[DB] SQLAlchemy engine created (pymssql)")
+    return _db_engine
 
 
 def ensure_table_exists():
@@ -470,7 +441,7 @@ def infer_geo_from_area(area: str) -> dict:
 
     country = None
     try:
-        r1      = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_1)
+        r1      = client.models.generate_content(model="gemini-2.5-flash-preview-05-20", contents=prompt_1)
         raw     = r1.text.strip()
         raw     = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
         match   = re.search(r'\{.*?\}', raw, re.DOTALL)
@@ -490,7 +461,9 @@ def infer_geo_from_area(area: str) -> dict:
             return {"Requesting Countries": country, "Requesting Regions": "Global", "Bill2Country": country}
 
     except Exception as e:
+        import traceback
         print(f"[GEO] Call 1 failed: {type(e).__name__}: {e}")
+        print(f"[GEO] Call 1 traceback: {traceback.format_exc()}")
 
     # ── CALL 2: RECOVERY — focused retry when Call 1 gives wrong result ────
     print(f"[GEO] Call 2 Recovery triggered for: '{area_clean}'")
@@ -508,7 +481,7 @@ def infer_geo_from_area(area: str) -> dict:
         "{\"country\": \"<country name>\"}"
     )
     try:
-        r2      = client.models.generate_content(model="gemini-2.5-flash", contents=prompt_2)
+        r2      = client.models.generate_content(model="gemini-2.5-flash-preview-05-20", contents=prompt_2)
         raw2    = r2.text.strip()
         raw2    = re.sub(r"```[a-zA-Z]*", "", raw2).replace("```", "").strip()
         match2  = re.search(r'\{.*?\}', raw2, re.DOTALL)
@@ -526,7 +499,9 @@ def infer_geo_from_area(area: str) -> dict:
             return {"Requesting Countries": country2, "Requesting Regions": "Global", "Bill2Country": country2}
 
     except Exception as e:
+        import traceback
         print(f"[GEO] Call 2 Recovery failed: {type(e).__name__}: {e}")
+        print(f"[GEO] Call 2 traceback: {traceback.format_exc()}")
 
     # ── FALLBACK — only if BOTH Gemini calls fail (network/API issue) ──────
     print(f"[GEO] Both Gemini calls failed for '{area_clean}' — using safe fallback")
