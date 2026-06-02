@@ -69,7 +69,46 @@ if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY must be set in your .env file")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = "gemini-2.5-flash"
+
+# gemini-2.0-flash: 1500 free requests/day vs gemini-2.5-flash's 20/day.
+# Switch back to "gemini-2.5-flash" only after upgrading to a paid Gemini plan.
+GEMINI_MODEL = "gemini-2.0-flash"
+
+# =========================================================
+# GEMINI CALL WITH RETRY-BACKOFF
+# Handles 429 RESOURCE_EXHAUSTED gracefully.
+# The API response always tells us exactly how many seconds to wait
+# (RetryInfo.retryDelay). We extract that, sleep, and retry once.
+# If the retry also fails we raise so the calling node can fall back.
+# =========================================================
+
+import time
+
+def gemini_generate(prompt: str, max_retries: int = 2) -> str:
+    """
+    Wrapper around client.models.generate_content that handles 429 rate-limit
+    errors with a single auto-retry after the delay Gemini specifies.
+    Returns the response .text on success; raises on permanent failure.
+    """
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            return response.text
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                # Extract retryDelay from error message (e.g. "retryDelay': '17s'")
+                delay_match = re.search(r"retry[Dd]elay['\"]?\s*:\s*['\"]?(\d+)", err_str)
+                wait_secs = int(delay_match.group(1)) if delay_match else 20
+                wait_secs = min(wait_secs + 3, 65)  # small buffer, cap at 65s
+                print(f"[GEMINI] 429 rate-limit on attempt {attempt+1}. "
+                      f"Waiting {wait_secs}s before retry...")
+                time.sleep(wait_secs)
+                if attempt == max_retries - 1:
+                    raise  # out of retries — let caller handle gracefully
+            else:
+                raise  # non-429 error — surface immediately
+    raise RuntimeError("gemini_generate: exhausted retries")
 
 # =========================================================
 # AZURE SQL DATABASE CONFIGURATION  (unchanged)
@@ -351,8 +390,8 @@ Return ONLY this JSON:
 }}"""
 
     try:
-        r = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        raw = r.text.strip()
+        raw = gemini_generate(prompt)
+        raw = raw.strip()
         raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         parsed = json.loads(match.group() if match else raw)
@@ -430,8 +469,8 @@ Return ONLY this JSON:
 }}"""
 
     try:
-        r = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        raw = r.text.strip()
+        raw = gemini_generate(prompt)
+        raw = raw.strip()
         raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         parsed = json.loads(match.group() if match else raw)
@@ -528,8 +567,7 @@ Captured demand data:
 Return ONLY the summary text (no JSON, no labels, no preamble). Write in formal business language."""
 
     try:
-        r = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        enriched_summary = r.text.strip()
+        enriched_summary = gemini_generate(prompt).strip()
 
         new_state = dict(state)
         new_state["captured"] = dict(captured)
@@ -668,8 +706,7 @@ def infer_geo_from_area(area: str) -> dict:
     )
     country = None
     try:
-        r1 = client.models.generate_content(model=GEMINI_MODEL, contents=prompt_1)
-        raw = r1.text.strip()
+        raw = gemini_generate(prompt_1).strip()
         raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
         match = re.search(r'\{.*?\}', raw, re.DOTALL)
         parsed = json.loads(match.group() if match else raw)
@@ -686,8 +723,7 @@ def infer_geo_from_area(area: str) -> dict:
         prompt_2 = (
             "Location: \"" + area_clean + "\"\nWhat sovereign country? Return ONLY: {\"country\": \"<name>\"}"
         )
-        r2 = client.models.generate_content(model=GEMINI_MODEL, contents=prompt_2)
-        raw2 = r2.text.strip()
+        raw2 = gemini_generate(prompt_2).strip()
         raw2 = re.sub(r"```[a-zA-Z]*", "", raw2).replace("```", "").strip()
         match2 = re.search(r'\{.*?\}', raw2, re.DOTALL)
         parsed2 = json.loads(match2.group() if match2 else raw2)
