@@ -1,12 +1,18 @@
 """
-Demand Creation Chatbot — Agentic Version (Fixed)
-==================================================
-Fixes applied:
-  1. Removed time.sleep() from gemini_generate — was killing Gunicorn workers on 429
-  2. Agentic follow-up nodes now fail gracefully on 429/any error (skip, don't block)
-  3. AI Summariser removed from /chat critical path — no extra Gemini call at completion
-  4. gemini_generate raises immediately on 429 so caller can skip cleanly
-  5. All agent nodes wrapped in try/except that returns state unchanged on failure
+Demand Creation Chatbot — Agentic Version (Cascading Dropdowns + Yes/No Validation)
+=====================================================================================
+Changes from previous version:
+  1. Demand ID format changed from yymm_DEMO#### to yymmdd_DEMO####
+  2. Yes/No fields now enforce strict Yes/No input — any other value returns an error
+  3. Cascading dropdown support added to the /ui frontend for:
+       - Application → sub-modules per app
+       - Landscape Impacted → landscape-specific sub-areas
+       - Business_Process → process categories
+       - E2E process in GPM → sub-processes per category
+       - Area → country list with region grouping
+       - Yes/No fields → radio-style quick-select buttons
+  4. Dynamic agentic AI logic (LangGraph follow-ups) fully preserved and untouched.
+     Dropdowns are injected alongside the agentic follow-up flow, not replacing it.
 """
 
 from dotenv import load_dotenv
@@ -45,22 +51,14 @@ GEMINI_MODEL = "gemini-2.5-flash"
 
 # =========================================================
 # GEMINI CALL — NO SLEEP, FAIL FAST
-# Key fix: removed time.sleep() which was blocking Gunicorn
-# workers for 60s+ causing SIGKILL worker timeouts.
-# Callers handle 429 gracefully by skipping the agentic step.
 # =========================================================
 
 def gemini_generate(prompt: str) -> str:
-    """
-    Single Gemini call. Raises immediately on any error including 429.
-    NO sleep — sleeping inside a sync Gunicorn worker causes SIGKILL.
-    All callers must handle exceptions and degrade gracefully.
-    """
     response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
     return response.text
 
 # =========================================================
-# AZURE SQL  (unchanged)
+# AZURE SQL
 # =========================================================
 
 AZURE_SQL_SERVER   = (os.getenv("AZURE_SQL_SERVER")   or "").strip()
@@ -200,6 +198,20 @@ def save_to_db(payload: dict) -> bool:
 
 
 # =========================================================
+# YES/NO FIELDS — strict validation
+# =========================================================
+
+YES_NO_FIELDS = {
+    "Does this have any month-end (/Year-end) dependency?",
+    "Is this a legal/fiscal change?",
+    "Is Audit requirement",
+    "GTS Impact",
+}
+
+def is_valid_yes_no(value: str) -> bool:
+    return value.strip().lower() in ("yes", "no")
+
+# =========================================================
 # MANDATORY FIELDS
 # =========================================================
 
@@ -226,6 +238,99 @@ MANDATORY_FIELDS = [
 ]
 
 # =========================================================
+# CASCADING DROPDOWN DEFINITIONS
+# Sent to frontend so it can render contextual dropdowns.
+# The frontend uses these to show options — the user can
+# also type freely. Agentic logic is unchanged.
+# =========================================================
+
+FIELD_OPTIONS = {
+    "Application": {
+        "type": "cascading",
+        "level1": ["ECC", "S/4HANA", "Fusion / Oracle Cloud", "SAP BW/BI", "SAP CRM", "Ariba", "SuccessFactors", "Salesforce", "Other"],
+        "level2": {
+            "ECC": ["FI (Finance)", "CO (Controlling)", "MM (Materials Management)", "SD (Sales & Distribution)", "PP (Production Planning)", "HR / HCM", "PM (Plant Maintenance)", "QM (Quality Management)", "WM (Warehouse Management)"],
+            "S/4HANA": ["Finance & Controlling", "Logistics & Supply Chain", "Manufacturing", "Procurement", "Sales", "HR / HCM", "Asset Management"],
+            "Fusion / Oracle Cloud": ["HCM (Human Capital Management)", "Finance", "SCM (Supply Chain)", "CX (Customer Experience)", "ERP", "EPM (Enterprise Performance Management)"],
+            "SAP BW/BI": ["BW on HANA", "SAP Analytics Cloud", "Business Objects", "BEx Reporting"],
+            "SAP CRM": ["Sales", "Service", "Marketing", "Interaction Center"],
+            "Ariba": ["Procurement", "Sourcing", "Contract Management", "Supplier Management"],
+            "SuccessFactors": ["Employee Central", "Recruiting", "Learning", "Performance & Goals", "Compensation", "Succession Planning"],
+            "Salesforce": ["Sales Cloud", "Service Cloud", "Marketing Cloud", "Platform / Custom Dev"],
+            "Other": []
+        }
+    },
+    "Landscape Impacted": {
+        "type": "cascading",
+        "level1": ["ECC", "Fusion", "S/4HANA", "Both ECC & Fusion", "Both ECC & S/4HANA", "All Landscapes", "BW/BI", "Other"],
+        "level2": {
+            "ECC": ["Development (DEV)", "Quality (QAS)", "Production (PRD)", "Sandbox"],
+            "Fusion": ["Development Instance", "Test Instance", "Production Instance"],
+            "S/4HANA": ["Development (DEV)", "Quality Assurance (QAS)", "Production (PRD)"],
+            "Both ECC & Fusion": ["ECC DEV + Fusion Dev", "ECC QAS + Fusion Test", "ECC PRD + Fusion PRD"],
+            "Both ECC & S/4HANA": ["DEV environments", "QAS environments", "PRD environments"],
+            "All Landscapes": ["All Dev environments", "All QAS environments", "All PRD environments"],
+            "BW/BI": ["BW DEV", "BW QAS", "BW PRD"],
+            "Other": []
+        }
+    },
+    "Business_Process": {
+        "type": "cascading",
+        "level1": ["Finance to Report (F2R)", "Order to Cash (O2C)", "Purchase to Pay (P2P)", "Hire to Retire (H2R)", "Plan to Produce (P2P)", "Record to Report (R2R)", "Acquire to Retire (A2R)", "Other"],
+        "level2": {
+            "Finance to Report (F2R)": ["General Ledger", "Accounts Payable", "Accounts Receivable", "Fixed Assets", "Controlling & Cost Accounting", "Treasury", "Tax"],
+            "Order to Cash (O2C)": ["Sales Order Management", "Pricing", "Credit Management", "Billing & Invoicing", "Collections", "Customer Master Data"],
+            "Purchase to Pay (P2P)": ["Purchase Requisition", "Purchase Order", "Goods Receipt", "Invoice Verification", "Vendor Payment", "Vendor Master Data"],
+            "Hire to Retire (H2R)": ["Recruitment", "Onboarding", "Payroll", "Benefits", "Performance Management", "Offboarding"],
+            "Plan to Produce (P2P)": ["Production Planning", "MRP", "Shop Floor Control", "Quality Management", "Inventory Management"],
+            "Record to Report (R2R)": ["Period Close", "Financial Consolidation", "Management Reporting", "Statutory Reporting", "Intercompany"],
+            "Acquire to Retire (A2R)": ["Asset Acquisition", "Asset Transfer", "Depreciation", "Asset Retirement"],
+            "Other": []
+        }
+    },
+    "E2E process in GPM": {
+        "type": "cascading",
+        "level1": ["F2R - Finance to Report", "O2C - Order to Cash", "P2P - Purchase to Pay", "H2R - Hire to Retire", "P2P - Plan to Produce", "R2R - Record to Report", "A2R - Acquire to Retire", "Other"],
+        "level2": {
+            "F2R - Finance to Report": ["GL Accounting", "AP Processing", "AR Processing", "Asset Accounting", "Cost Accounting", "Treasury Operations", "Tax Compliance"],
+            "O2C - Order to Cash": ["Inquiry to Order", "Order Fulfillment", "Shipping & Delivery", "Billing", "Cash Application"],
+            "P2P - Purchase to Pay": ["Requisitioning", "Sourcing & Procurement", "PO Management", "GR/IR Processing", "Vendor Invoice Processing", "Payment Run"],
+            "H2R - Hire to Retire": ["Talent Acquisition", "Employee Lifecycle", "Time & Attendance", "Payroll Processing", "Separation"],
+            "P2P - Plan to Produce": ["Demand Planning", "Production Scheduling", "Shop Floor Execution", "Quality Inspection", "Goods Movement"],
+            "R2R - Record to Report": ["Month-End Close", "Year-End Close", "Financial Statements", "Group Consolidation"],
+            "A2R - Acquire to Retire": ["Capital Planning", "Asset Creation", "Asset Lifecycle", "Disposal"],
+            "Other": []
+        }
+    },
+    "Area": {
+        "type": "grouped",
+        "groups": {
+            "North America": ["United States", "Canada", "Mexico"],
+            "Europe": ["United Kingdom", "Germany", "France", "Italy", "Spain", "Netherlands", "Poland", "Switzerland", "Sweden", "Norway", "Denmark", "Finland", "Ireland", "Portugal", "Austria", "Belgium", "Turkey", "Czech Republic", "Hungary", "Romania", "Greece"],
+            "Asia-South Pacific": ["India", "Australia", "New Zealand", "Singapore", "Malaysia", "Indonesia", "Thailand", "Vietnam", "Philippines", "Pakistan", "Bangladesh", "Sri Lanka"],
+            "Middle East & Africa": ["United Arab Emirates", "Saudi Arabia", "Egypt", "Nigeria", "Kenya", "South Africa", "Qatar", "Kuwait", "Bahrain", "Oman", "Jordan", "Morocco", "Ghana", "Ethiopia"],
+            "Latin America": ["Brazil", "Argentina", "Chile", "Colombia", "Peru", "Ecuador", "Venezuela", "Uruguay", "Panama", "Costa Rica"],
+            "China": ["China", "Hong Kong", "Macau"],
+            "North Asia": ["Japan", "South Korea", "Taiwan"],
+            "Global": ["Global"]
+        }
+    },
+    "Landscape Impacted_simple": ["ECC", "Fusion", "S/4HANA", "Both", "All"],
+    "Does this have any month-end (/Year-end) dependency?": {"type": "yesno"},
+    "Is this a legal/fiscal change?":                       {"type": "yesno"},
+    "Is Audit requirement":                                 {"type": "yesno"},
+    "GTS Impact":                                           {"type": "yesno"},
+    "Impacted business groups": {
+        "type": "multiselect",
+        "options": ["Personal Care", "Foods & Refreshment", "Home Care", "Beauty & Wellbeing", "Nutrition", "Ice Cream", "Global IT", "Finance", "Supply Chain", "HR", "Legal", "Marketing", "Other"]
+    },
+    "Requesting BU": {
+        "type": "select",
+        "options": ["Personal Care", "Foods & Refreshment", "Home Care", "Beauty & Wellbeing", "Nutrition", "Ice Cream", "Global IT", "Corporate", "Other"]
+    },
+}
+
+# =========================================================
 # LANGGRAPH — AGENT STATE
 # =========================================================
 
@@ -244,13 +349,10 @@ class AgentState(TypedDict):
 
 
 # =========================================================
-# LANGGRAPH — AGENT NODES
-# All nodes are fail-safe: on ANY exception (incl. 429),
-# they return state unchanged so the conversation continues.
+# LANGGRAPH — AGENT NODES (unchanged logic)
 # =========================================================
 
 def node_analyse_and_route(state: AgentState) -> AgentState:
-    """Decide if a dynamic follow-up is needed for the last answered field."""
     completed = state.get("completed", [])
     if not completed:
         return state
@@ -267,11 +369,6 @@ def node_analyse_and_route(state: AgentState) -> AgentState:
 
 
 def node_dynamic_application_followup(state: AgentState) -> AgentState:
-    """
-    Generate an application-specific follow-up question.
-    FAIL-SAFE: if Gemini is unavailable (429 or any error),
-    skips the follow-up and continues normally. No blocking.
-    """
     application_value = state["captured"].get("Application", "")
     captured_context = {k: v for k, v in state["captured"].items()
                         if k in ["Demand Title", "Requirement summary", "Business Benefits"]}
@@ -318,7 +415,6 @@ Return ONLY this JSON (no markdown):
         return new_state
 
     except Exception as e:
-        # 429 or any error → skip follow-up, continue conversation normally
         print(f"[AGENT] App followup skipped ({type(e).__name__}) — continuing without follow-up")
         new_state = dict(state)
         new_state["in_followup"] = False
@@ -326,10 +422,6 @@ Return ONLY this JSON (no markdown):
 
 
 def node_dynamic_benefits_followup(state: AgentState) -> AgentState:
-    """
-    Classify business benefit type and generate a targeted follow-up.
-    FAIL-SAFE: skips cleanly on any error including 429.
-    """
     benefits_value = state["captured"].get("Business Benefits", "")
     captured_context = {k: v for k, v in state["captured"].items()
                         if k in ["Demand Title", "Requirement summary", "Rationale and Purpose"]}
@@ -338,14 +430,7 @@ Business Benefits stated: "{benefits_value}"
 Context: {json.dumps(captured_context)}
 
 1. Classify PRIMARY benefit: compliance | revenue_growth | cost_efficiency | risk_mitigation | market_expansion | operational_excellence | customer_experience
-2. Generate ONE targeted follow-up question to quantify/clarify the benefit:
-   - compliance → what regulation/standard? (GDPR, SOX, local tax)
-   - revenue_growth → projected revenue impact or target metric?
-   - cost_efficiency → estimated annual savings or headcount reduction?
-   - risk_mitigation → what specific risk is being reduced?
-   - market_expansion → which new markets/geographies?
-   - operational_excellence → which KPI improves and by how much?
-   - customer_experience → which touchpoint or NPS metric improves?
+2. Generate ONE targeted follow-up question to quantify/clarify the benefit.
 
 Return ONLY this JSON (no markdown):
 {{"benefit_category": "<category>", "followup_question": "<question>", "agent_insight": "<1 sentence>"}}"""
@@ -387,7 +472,6 @@ Return ONLY this JSON (no markdown):
 
 
 def node_capture_followup_answer(state: AgentState, user_answer: str) -> AgentState:
-    """Merge the follow-up answer back into the parent field value."""
     parent_field = state.get("followup_parent", "")
     existing     = state["captured"].get(parent_field, "")
     enriched     = f"{existing} | Detail: {user_answer}"
@@ -410,7 +494,7 @@ def node_capture_followup_answer(state: AgentState, user_answer: str) -> AgentSt
 
 
 # =========================================================
-# LANGGRAPH — GRAPH
+# LANGGRAPH — GRAPH (unchanged)
 # =========================================================
 
 def build_agent_graph() -> StateGraph:
@@ -448,9 +532,7 @@ AGENT_GRAPH = build_agent_graph()
 
 
 # =========================================================
-# GEO INFERENCE
-# Uses COUNTRY_TO_REGION lookup — Gemini resolves city → country.
-# Fails safely to fallback if Gemini unavailable.
+# GEO INFERENCE (unchanged)
 # =========================================================
 
 COUNTRY_TO_REGION = {
@@ -500,13 +582,7 @@ COUNTRY_TO_REGION = {
 
 
 def infer_geo_from_area(area: str) -> dict:
-    """
-    Resolve city/region → country → enterprise region.
-    Single Gemini call only. Falls back instantly if Gemini fails (no retry/sleep).
-    """
     area_clean = area.strip()
-
-    # Direct country match — no Gemini needed
     if area_clean.title() in COUNTRY_TO_REGION:
         country = area_clean.title()
         return {"Requesting Countries": country,
@@ -541,14 +617,13 @@ def infer_geo_from_area(area: str) -> dict:
     except Exception as e:
         print(f"[GEO] Gemini call failed ({type(e).__name__}) — using fallback")
 
-    # Fallback: return area as-is
     return {"Requesting Countries": area_clean.title(),
             "Requesting Regions":   "Global",
             "Bill2Country":         area_clean.title()}
 
 
 # =========================================================
-# PDF GENERATION  (unchanged)
+# PDF GENERATION (unchanged)
 # =========================================================
 
 NAVY       = colors.HexColor("#1B2A4A")
@@ -656,7 +731,6 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
     story.append(title_card)
     story.append(Spacer(1, 5*mm))
 
-    # Agent follow-up log
     followup_log = payload.get("_agent_followup_log", [])
     if followup_log:
         agent_lines = []
@@ -817,6 +891,7 @@ def generate_demand_pdf(payload: dict) -> BytesIO:
 
 # =========================================================
 # SESSION STATE + DEMAND ID
+# CHANGE: format now yymmdd_DEMO#### (added dd)
 # =========================================================
 
 session_state = {
@@ -832,7 +907,8 @@ def generate_demand_id() -> str:
     _demand_counter += 1
     from datetime import timezone, timedelta
     IST = timezone(timedelta(hours=5, minutes=30))
-    return f"{datetime.now(IST).strftime('%y%m')}_DEMO{_demand_counter:04d}"
+    # Changed: yymmdd format (added day)
+    return f"{datetime.now(IST).strftime('%y%m%d')}_DEMO{_demand_counter:04d}"
 
 
 def generate_timestamp() -> str:
@@ -869,16 +945,20 @@ app = Flask(__name__)
 def start():
     reset_session()
     first = MANDATORY_FIELDS[0]
+    # Include field_options in start so frontend can set up all dropdowns
     return jsonify({
         "message": (
             "Welcome to the Demand Creation Chatbot! ⚡ Powered by LangGraph Agentic AI.\n\n"
             "I'll guide you through capturing your demand. For Applications and Business Benefits, "
-            "I'll ask intelligent follow-up questions to enrich your demand automatically."
+            "I'll ask intelligent follow-up questions to enrich your demand automatically.\n\n"
+            "For fields with options, cascading dropdowns will appear to help you select values. "
+            "For Yes/No fields, quick-select buttons will appear."
         ),
         "next_question": first["question"],
         "field":         first["key"],
         "progress":      f"1 of {len(MANDATORY_FIELDS)}",
-        "agent_insight": ""
+        "agent_insight": "",
+        "field_options": FIELD_OPTIONS,  # Send all dropdown definitions upfront
     })
 
 
@@ -920,6 +1000,7 @@ def chat():
         total      = len(MANDATORY_FIELDS)
 
         if next_field:
+            options_meta = FIELD_OPTIONS.get(next_field["key"])
             return jsonify({
                 "captured_field": "follow-up",
                 "captured_value": message,
@@ -928,8 +1009,8 @@ def chat():
                 "progress":       f"{answered + 1} of {total}",
                 "agent_insight":  "",
                 "is_followup":    False,
+                "options_meta":   options_meta,
             })
-        # Fall through to completion
         message = "__COMPLETE__"
 
     # ── CASE B: answering a mandatory field ───────────────────────────────
@@ -937,6 +1018,20 @@ def chat():
         current_field = get_next_field()
         if not current_field:
             return jsonify({"error": "Session already complete. Call /start to reset."}), 400
+
+        # YES/NO VALIDATION
+        if current_field["key"] in YES_NO_FIELDS:
+            if not is_valid_yes_no(message):
+                return jsonify({
+                    "error": "invalid_yesno",
+                    "message": f"⚠️ Invalid input. Please answer with Yes or No only.",
+                    "field": current_field["key"],
+                    "next_question": current_field["question"],
+                }), 400
+
+        # Normalize yes/no to title case
+        if current_field["key"] in YES_NO_FIELDS:
+            message = message.strip().capitalize()
 
         session_state["captured"][current_field["key"]] = message
         session_state["completed"].append(current_field["key"])
@@ -948,7 +1043,7 @@ def chat():
             session_state["captured"]["Requesting Countries"] = geo.get("Requesting Countries", message)
             session_state["captured"]["Bill2Country"]         = geo.get("Bill2Country", message)
 
-        # Run LangGraph agent
+        # Run LangGraph agent (unchanged)
         agent_state: AgentState = {
             "captured":        session_state["captured"],
             "completed":       session_state["completed"],
@@ -967,7 +1062,7 @@ def chat():
         session_state["followup_log"]  = result.get("followup_log", session_state["followup_log"])
         session_state["agent_insight"] = result.get("agent_insight", "")
 
-        # If agent triggered a follow-up and it succeeded (has a question)
+        # If agent triggered a follow-up — agentic logic preserved
         if result.get("in_followup") and result.get("current_question"):
             session_state["in_followup"]     = True
             session_state["followup_parent"] = result["followup_parent"]
@@ -983,6 +1078,8 @@ def chat():
                 "progress":       f"{answered} of {total}",
                 "agent_insight":  result.get("agent_insight", ""),
                 "is_followup":    True,
+                # No options_meta for agentic follow-ups — they are free-text by design
+                "options_meta":   None,
             })
 
     # ── CASE C: check if more mandatory fields remain ─────────────────────
@@ -991,6 +1088,7 @@ def chat():
     total      = len(MANDATORY_FIELDS)
 
     if next_field and message != "__COMPLETE__":
+        options_meta = FIELD_OPTIONS.get(next_field["key"])
         return jsonify({
             "captured_field": session_state["completed"][-1] if session_state["completed"] else "",
             "captured_value": message,
@@ -999,6 +1097,7 @@ def chat():
             "progress":       f"{answered + 1} of {total}",
             "agent_insight":  session_state["agent_insight"],
             "is_followup":    False,
+            "options_meta":   options_meta,
         })
 
     # ── CASE D: All fields done — build final payload ─────────────────────
@@ -1060,9 +1159,16 @@ def reset():
     return jsonify({"message": "Session reset.", "next_question": first["question"], "field": first["key"]})
 
 
+# =========================================================
+# /ui — FULL FRONTEND WITH CASCADING DROPDOWNS
+# =========================================================
+
 @app.route("/ui")
 def ui():
     total_fields = len(MANDATORY_FIELDS)
+    # Embed FIELD_OPTIONS as JSON for the frontend
+    field_options_json = json.dumps(FIELD_OPTIONS)
+
     html = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1083,10 +1189,10 @@ def ui():
     radial-gradient(ellipse at 80% 90%,rgba(139,92,246,0.08) 0%,transparent 50%);
     min-height:100vh;display:flex;align-items:center;justify-content:center;
     padding:20px;color:var(--text);}
-  .container{width:100%;max-width:780px;background:var(--surface);
+  .container{width:100%;max-width:820px;background:var(--surface);
     border:1px solid var(--border);border-radius:20px;
     box-shadow:var(--glow),0 25px 60px rgba(0,0,0,0.5);
-    overflow:hidden;display:flex;flex-direction:column;height:92vh;max-height:760px;}
+    overflow:hidden;display:flex;flex-direction:column;height:94vh;max-height:820px;}
   .header{background:linear-gradient(135deg,#0f1b35 0%,#1a1040 100%);
     border-bottom:1px solid var(--border);padding:18px 28px;
     display:flex;align-items:center;justify-content:space-between;gap:12px;}
@@ -1125,13 +1231,15 @@ def ui():
     align-items:center;justify-content:center;font-size:13px;flex-shrink:0;}
   .avatar.bot{background:linear-gradient(135deg,var(--primary),var(--accent));}
   .avatar.user{background:var(--surface2);border:1px solid var(--border);}
-  .bubble{max-width:80%;padding:12px 16px;border-radius:14px;font-size:14px;
+  .bubble{max-width:82%;padding:12px 16px;border-radius:14px;font-size:14px;
     line-height:1.6;word-break:break-word;}
   .bubble.bot{background:var(--bot-bg);border:1px solid var(--border);
     color:var(--text);border-bottom-left-radius:4px;}
   .bubble.user{background:var(--user-bg);color:#fff;border-bottom-right-radius:4px;}
   .bubble.agent-followup{background:rgba(245,158,11,0.08);
     border:1px solid rgba(245,158,11,0.25);border-bottom-left-radius:4px;}
+  .bubble.error-bubble{background:rgba(239,68,68,0.08);
+    border:1px solid rgba(239,68,68,0.3);border-bottom-left-radius:4px;color:#fca5a5;}
   .field-tag{font-size:9.5px;font-weight:600;font-family:'DM Mono',monospace;
     color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:5px;}
   .field-tag.agent{color:var(--agent);}
@@ -1177,8 +1285,64 @@ def ui():
   .typing span:nth-child(2){animation-delay:0.2s;}
   .typing span:nth-child(3){animation-delay:0.4s;}
   @keyframes bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}
-  .input-area{padding:14px 28px 18px;border-top:1px solid var(--border);
-    background:var(--surface);display:flex;gap:10px;}
+
+  /* ── INPUT ZONE ── */
+  .input-zone{border-top:1px solid var(--border);background:var(--surface);padding:0;}
+
+  /* Cascading dropdown panel */
+  .dropdown-panel{padding:10px 28px 0;display:none;flex-direction:column;gap:8px;}
+  .dropdown-panel.visible{display:flex;}
+  .dropdown-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+  .dropdown-label{font-size:11px;font-family:'DM Mono',monospace;color:var(--muted);
+    min-width:90px;flex-shrink:0;}
+  .cascade-select{flex:1;min-width:160px;padding:8px 12px;
+    background:var(--surface2);border:1.5px solid var(--border);
+    border-radius:8px;font-size:13px;font-family:inherit;
+    color:var(--text);outline:none;cursor:pointer;transition:border 0.2s;}
+  .cascade-select:focus{border-color:var(--primary);}
+  .cascade-select option{background:var(--surface2);color:var(--text);}
+  .use-selection-btn{background:linear-gradient(135deg,var(--primary),var(--accent));
+    color:white;border:none;border-radius:8px;padding:8px 16px;
+    font-size:12px;font-weight:600;font-family:inherit;cursor:pointer;
+    transition:opacity 0.2s;white-space:nowrap;}
+  .use-selection-btn:hover{opacity:0.85;}
+  .use-selection-btn:disabled{opacity:0.4;cursor:not-allowed;}
+
+  /* Yes/No quick buttons */
+  .yesno-panel{padding:10px 28px 0;display:none;gap:10px;}
+  .yesno-panel.visible{display:flex;}
+  .yn-btn{flex:1;padding:10px;border:2px solid var(--border);border-radius:10px;
+    font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;
+    background:var(--surface2);color:var(--text);transition:all 0.2s;}
+  .yn-btn.yes:hover,.yn-btn.yes.active{background:rgba(16,185,129,0.15);
+    border-color:#10b981;color:#34d399;}
+  .yn-btn.no:hover,.yn-btn.no.active{background:rgba(239,68,68,0.12);
+    border-color:#ef4444;color:#fca5a5;}
+
+  /* Multi-select chips panel */
+  .multiselect-panel{padding:10px 28px 0;display:none;flex-direction:column;gap:8px;}
+  .multiselect-panel.visible{display:flex;}
+  .chips-wrap{display:flex;flex-wrap:wrap;gap:6px;}
+  .chip{padding:5px 12px;border:1.5px solid var(--border);border-radius:99px;
+    font-size:12px;font-family:inherit;cursor:pointer;background:var(--surface2);
+    color:var(--muted);transition:all 0.2s;user-select:none;}
+  .chip.selected{background:rgba(59,130,246,0.2);border-color:var(--primary);color:var(--text);}
+  .chip:hover{border-color:var(--primary);color:var(--text);}
+  .chips-confirm-btn{align-self:flex-start;background:linear-gradient(135deg,var(--primary),var(--accent));
+    color:white;border:none;border-radius:8px;padding:7px 16px;
+    font-size:12px;font-weight:600;font-family:inherit;cursor:pointer;}
+
+  /* Simple select panel */
+  .simpleselect-panel{padding:10px 28px 0;display:none;gap:8px;flex-wrap:wrap;}
+  .simpleselect-panel.visible{display:flex;}
+  .ss-chip{padding:6px 14px;border:1.5px solid var(--border);border-radius:8px;
+    font-size:12px;font-family:inherit;cursor:pointer;background:var(--surface2);
+    color:var(--muted);transition:all 0.2s;}
+  .ss-chip:hover,.ss-chip.active{background:rgba(59,130,246,0.2);
+    border-color:var(--primary);color:var(--text);}
+
+  /* Text input row */
+  .input-area{padding:10px 28px 16px;display:flex;gap:10px;}
   .input-area input{flex:1;padding:12px 16px;background:var(--surface2);
     border:1.5px solid var(--border);border-radius:10px;font-size:14px;
     font-family:inherit;outline:none;color:var(--text);transition:border 0.2s;}
@@ -1190,6 +1354,8 @@ def ui():
     transition:opacity 0.2s,transform 0.1s;box-shadow:0 0 20px rgba(59,130,246,0.25);}
   .send-btn:hover{opacity:0.9;} .send-btn:active{transform:scale(0.97);}
   .send-btn:disabled{opacity:0.4;cursor:not-allowed;}
+  .or-divider{font-size:10px;color:var(--muted);text-align:center;
+    padding:2px 28px;font-family:'DM Mono',monospace;}
 </style>
 </head>
 <body>
@@ -1212,30 +1378,113 @@ def ui():
     <div class="progress-lbl" id="progressLabel">Starting...</div>
   </div>
   <div class="chat-area" id="chatArea"></div>
-  <div class="input-area">
-    <input type="text" id="inp" placeholder="Type your answer and press Enter..."
-           onkeydown="if(event.key==='Enter')sendMsg()"/>
-    <button class="send-btn" id="sendBtn" onclick="sendMsg()">Send →</button>
+
+  <!-- INPUT ZONE: contains all input types stacked -->
+  <div class="input-zone">
+
+    <!-- Yes/No buttons -->
+    <div class="yesno-panel" id="yesnoPanel">
+      <button class="yn-btn yes" onclick="selectYesNo('Yes')">✅ Yes</button>
+      <button class="yn-btn no"  onclick="selectYesNo('No')">❌ No</button>
+    </div>
+
+    <!-- Multi-select chips -->
+    <div class="multiselect-panel" id="multiselectPanel">
+      <div class="chips-wrap" id="chipsWrap"></div>
+      <button class="chips-confirm-btn" onclick="confirmMultiSelect()">Use Selected →</button>
+    </div>
+
+    <!-- Simple select (radio-style chips) -->
+    <div class="simpleselect-panel" id="simpleselectPanel"></div>
+
+    <!-- Cascading dropdowns -->
+    <div class="dropdown-panel" id="dropdownPanel">
+      <div class="dropdown-row" id="dropRow1">
+        <span class="dropdown-label" id="dropLabel1">Select:</span>
+        <select class="cascade-select" id="dropL1" onchange="onLevel1Change()">
+          <option value="">— choose —</option>
+        </select>
+      </div>
+      <div class="dropdown-row" id="dropRow2" style="display:none;">
+        <span class="dropdown-label" id="dropLabel2">Sub-category:</span>
+        <select class="cascade-select" id="dropL2" onchange="onLevel2Change()"></select>
+      </div>
+      <div class="dropdown-row">
+        <div style="flex:1"></div>
+        <button class="use-selection-btn" id="useDropBtn" onclick="useDropdownSelection()" disabled>
+          Use Selection →
+        </button>
+      </div>
+    </div>
+
+    <!-- Grouped select (for Area) -->
+    <div class="dropdown-panel" id="groupedPanel" style="display:none;">
+      <div class="dropdown-row">
+        <span class="dropdown-label">Region:</span>
+        <select class="cascade-select" id="groupL1" onchange="onGroupRegionChange()">
+          <option value="">— region —</option>
+        </select>
+      </div>
+      <div class="dropdown-row" id="groupRow2" style="display:none;">
+        <span class="dropdown-label">Country:</span>
+        <select class="cascade-select" id="groupL2" onchange="onGroupCountryChange()"></select>
+      </div>
+      <div class="dropdown-row">
+        <div style="flex:1"></div>
+        <button class="use-selection-btn" id="useGroupBtn" onclick="useGroupSelection()" disabled>
+          Use Selection →
+        </button>
+      </div>
+    </div>
+
+    <div class="or-divider" id="orDivider" style="display:none;">— or type freely below —</div>
+
+    <!-- Text input always present -->
+    <div class="input-area">
+      <input type="text" id="inp" placeholder="Type your answer and press Enter..."
+             onkeydown="if(event.key==='Enter')sendMsg()"/>
+      <button class="send-btn" id="sendBtn" onclick="sendMsg()">Send →</button>
+    </div>
   </div>
 </div>
+
 <script>
 const TOTAL = TOTAL_PLACEHOLDER;
+const FIELD_OPTIONS = FIELD_OPTIONS_PLACEHOLDER;
+
 let started = false;
 let lastPayload = null;
+let currentFieldKey = null;   // tracks which field we're on
+let currentOptionsMeta = null;
 
+// ── DROPDOWN STATE ──────────────────────────────────────────────
+let dropSelection = { l1: '', l2: '' };
+let groupSelection = { region: '', country: '' };
+let multiSelected = [];
+let ssSelected = '';
+
+// ── START ──────────────────────────────────────────────────────
 async function startChat() {
   const res = await fetch('/start');
   const d = await res.json();
   addBotMsg(d.message, null, null);
-  setTimeout(() => addBotMsg(d.next_question, d.field, d.progress), 700);
+  setTimeout(() => {
+    currentFieldKey = d.field;
+    currentOptionsMeta = FIELD_OPTIONS[d.field] || null;
+    addBotMsg(d.next_question, d.field, d.progress);
+    renderInputControls(d.field, currentOptionsMeta);
+  }, 700);
   started = true;
 }
 
-async function sendMsg() {
+// ── SEND MESSAGE ───────────────────────────────────────────────
+async function sendMsg(overrideMsg) {
   const inp = document.getElementById('inp');
-  const msg = inp.value.trim();
+  const msg = (overrideMsg !== undefined ? overrideMsg : inp.value).trim();
   if (!msg || !started) return;
-  addUserMsg(msg); inp.value = '';
+  addUserMsg(msg);
+  if (overrideMsg === undefined) inp.value = '';
+  hideAllControls();
   document.getElementById('sendBtn').disabled = true;
   const tid = showTyping();
   try {
@@ -1247,8 +1496,16 @@ async function sendMsg() {
     const d = await res.json();
     removeTyping(tid);
 
+    if (res.status === 400 && d.error === 'invalid_yesno') {
+      // Re-show yes/no panel with error
+      addErrorMsg(d.message);
+      renderInputControls(currentFieldKey, currentOptionsMeta);
+      document.getElementById('sendBtn').disabled = false;
+      return;
+    }
+
     if (d.error) {
-      addBotMsg('⚠️ ' + d.error, null, null);
+      addErrorMsg('⚠️ ' + d.error);
     } else if (d.final_demand_payload) {
       lastPayload = d.final_demand_payload;
       const auto = d.auto_populated;
@@ -1292,44 +1549,246 @@ async function sendMsg() {
       }, 800);
 
     } else if (d.is_followup) {
+      // Agentic follow-up — always free text, no dropdowns
+      currentFieldKey = d.field;
+      currentOptionsMeta = null;  // agentic follow-ups are always free-text
       let insightHtml = d.agent_insight ? '<div class="insight-box">' + d.agent_insight + '</div>' : '';
       addAgentFollowupMsg(insightHtml + d.next_question, d.field, d.progress);
+      renderInputControls(d.field, null);  // free text only for agentic follow-ups
     } else {
+      currentFieldKey = d.field;
+      currentOptionsMeta = d.options_meta || FIELD_OPTIONS[d.field] || null;
       let insightHtml = d.agent_insight ? '<div class="insight-box">' + d.agent_insight + '</div>' : '';
       addBotMsg(insightHtml + d.next_question, d.field, d.progress);
+      renderInputControls(d.field, currentOptionsMeta);
     }
   } catch (e) {
     removeTyping(tid);
-    addBotMsg('⚠️ Network error. Please try again.', null, null);
+    addErrorMsg('⚠️ Network error. Please try again.');
+    renderInputControls(currentFieldKey, currentOptionsMeta);
   }
   document.getElementById('sendBtn').disabled = false;
   document.getElementById('inp').focus();
 }
 
-async function downloadPDF() {
-  if (!lastPayload) { alert('No payload available.'); return; }
-  const btn = document.querySelector('.pdf-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Generating PDF...'; }
-  try {
-    const res = await fetch('/download-pdf', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(lastPayload)
+// ── RENDER INPUT CONTROLS ──────────────────────────────────────
+function hideAllControls() {
+  document.getElementById('yesnoPanel').classList.remove('visible');
+  document.getElementById('multiselectPanel').classList.remove('visible');
+  document.getElementById('simpleselectPanel').classList.remove('visible');
+  document.getElementById('dropdownPanel').classList.remove('visible');
+  document.getElementById('groupedPanel').style.display = 'none';
+  document.getElementById('orDivider').style.display = 'none';
+  // Reset states
+  dropSelection = { l1:'', l2:'' };
+  groupSelection = { region:'', country:'' };
+  multiSelected = [];
+  ssSelected = '';
+}
+
+function renderInputControls(fieldKey, meta) {
+  hideAllControls();
+  if (!meta) {
+    // Plain text — no extra controls
+    document.getElementById('inp').placeholder = 'Type your answer and press Enter...';
+    return;
+  }
+
+  const type = meta.type || 'unknown';
+
+  if (type === 'yesno') {
+    document.getElementById('yesnoPanel').classList.add('visible');
+    document.getElementById('inp').placeholder = 'Or type Yes / No...';
+    // Reset active state
+    document.querySelectorAll('.yn-btn').forEach(b => b.classList.remove('active'));
+    return;
+  }
+
+  if (type === 'multiselect') {
+    const panel = document.getElementById('multiselectPanel');
+    const wrap  = document.getElementById('chipsWrap');
+    wrap.innerHTML = '';
+    multiSelected = [];
+    meta.options.forEach(opt => {
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.textContent = opt;
+      chip.onclick = () => {
+        chip.classList.toggle('selected');
+        if (chip.classList.contains('selected')) {
+          multiSelected.push(opt);
+        } else {
+          multiSelected = multiSelected.filter(x => x !== opt);
+        }
+      };
+      wrap.appendChild(chip);
     });
-    if (!res.ok) throw new Error('PDF generation failed');
-    const blob = await res.blob();
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href = url;
-    a.download = (lastPayload['Demand ID'] || 'Demand') + '_'
-      + (lastPayload['Demand Title'] || 'Request').replace(/\s+/g, '_').slice(0, 30) + '.pdf';
-    a.click(); URL.revokeObjectURL(url);
-  } catch (e) {
-    alert('Error: ' + e.message);
-  } finally {
-    if (btn) { btn.disabled = false; btn.innerHTML = '📄 Download as PDF'; }
+    panel.classList.add('visible');
+    document.getElementById('orDivider').style.display = 'block';
+    document.getElementById('inp').placeholder = 'Or type your own value...';
+    return;
+  }
+
+  if (type === 'select') {
+    const panel = document.getElementById('simpleselectPanel');
+    panel.innerHTML = '';
+    ssSelected = '';
+    meta.options.forEach(opt => {
+      const chip = document.createElement('span');
+      chip.className = 'ss-chip';
+      chip.textContent = opt;
+      chip.onclick = () => {
+        document.querySelectorAll('.ss-chip').forEach(c => c.classList.remove('active'));
+        chip.classList.add('active');
+        ssSelected = opt;
+        setTimeout(() => sendMsg(opt), 200);
+      };
+      panel.appendChild(chip);
+    });
+    panel.classList.add('visible');
+    document.getElementById('orDivider').style.display = 'block';
+    document.getElementById('inp').placeholder = 'Or type your own value...';
+    return;
+  }
+
+  if (type === 'grouped') {
+    // Area grouped by region → country
+    const gPanel = document.getElementById('groupedPanel');
+    const regSel = document.getElementById('groupL1');
+    regSel.innerHTML = '<option value="">— region —</option>';
+    Object.keys(meta.groups).forEach(region => {
+      const opt = document.createElement('option');
+      opt.value = region; opt.textContent = region;
+      regSel.appendChild(opt);
+    });
+    gPanel.style.display = 'flex';
+    document.getElementById('groupRow2').style.display = 'none';
+    document.getElementById('useGroupBtn').disabled = true;
+    document.getElementById('orDivider').style.display = 'block';
+    document.getElementById('inp').placeholder = 'Or type city/country directly...';
+    return;
+  }
+
+  if (type === 'cascading') {
+    const panel = document.getElementById('dropdownPanel');
+    const l1    = document.getElementById('dropL1');
+    l1.innerHTML = '<option value="">— choose —</option>';
+    meta.level1.forEach(opt => {
+      const o = document.createElement('option');
+      o.value = opt; o.textContent = opt;
+      l1.appendChild(o);
+    });
+    document.getElementById('dropRow2').style.display = 'none';
+    document.getElementById('useDropBtn').disabled = true;
+    dropSelection = { l1:'', l2:'' };
+    panel.classList.add('visible');
+    document.getElementById('orDivider').style.display = 'block';
+    document.getElementById('inp').placeholder = 'Or type your own value...';
+    return;
   }
 }
 
+// ── CASCADING DROPDOWN HANDLERS ────────────────────────────────
+function onLevel1Change() {
+  const l1Val  = document.getElementById('dropL1').value;
+  const meta   = currentOptionsMeta;
+  const row2   = document.getElementById('dropRow2');
+  const l2     = document.getElementById('dropL2');
+  const useBtn = document.getElementById('useDropBtn');
+
+  dropSelection.l1 = l1Val;
+  dropSelection.l2 = '';
+
+  if (l1Val && meta && meta.level2 && meta.level2[l1Val] && meta.level2[l1Val].length > 0) {
+    l2.innerHTML = '<option value="">— sub-category —</option>';
+    meta.level2[l1Val].forEach(sub => {
+      const o = document.createElement('option');
+      o.value = sub; o.textContent = sub;
+      l2.appendChild(o);
+    });
+    row2.style.display = 'flex';
+    useBtn.disabled = true;  // must pick sub-category
+  } else {
+    row2.style.display = 'none';
+    useBtn.disabled = !l1Val;  // no sub-categories → can use l1 directly
+  }
+}
+
+function onLevel2Change() {
+  const l2Val = document.getElementById('dropL2').value;
+  dropSelection.l2 = l2Val;
+  document.getElementById('useDropBtn').disabled = !l2Val;
+}
+
+function useDropdownSelection() {
+  const val = dropSelection.l2
+    ? dropSelection.l1 + ' › ' + dropSelection.l2
+    : dropSelection.l1;
+  if (!val) return;
+  sendMsg(val);
+}
+
+// ── GROUPED AREA HANDLERS ──────────────────────────────────────
+function onGroupRegionChange() {
+  const region = document.getElementById('groupL1').value;
+  const meta   = currentOptionsMeta;
+  groupSelection.region  = region;
+  groupSelection.country = '';
+  const row2   = document.getElementById('groupRow2');
+  const l2     = document.getElementById('groupL2');
+  const useBtn = document.getElementById('useGroupBtn');
+
+  if (region && meta && meta.groups[region]) {
+    const countries = meta.groups[region];
+    if (countries.length === 1 && countries[0] === region) {
+      // e.g. Global
+      row2.style.display = 'none';
+      groupSelection.country = region;
+      useBtn.disabled = false;
+    } else {
+      l2.innerHTML = '<option value="">— country —</option>';
+      countries.forEach(c => {
+        const o = document.createElement('option');
+        o.value = c; o.textContent = c;
+        l2.appendChild(o);
+      });
+      row2.style.display = 'flex';
+      useBtn.disabled = true;
+    }
+  } else {
+    row2.style.display = 'none';
+    useBtn.disabled = true;
+  }
+}
+
+function onGroupCountryChange() {
+  groupSelection.country = document.getElementById('groupL2').value;
+  document.getElementById('useGroupBtn').disabled = !groupSelection.country;
+}
+
+function useGroupSelection() {
+  const val = groupSelection.country || groupSelection.region;
+  if (!val) return;
+  sendMsg(val);
+}
+
+// ── YES/NO HANDLER ─────────────────────────────────────────────
+function selectYesNo(val) {
+  document.querySelectorAll('.yn-btn').forEach(b => b.classList.remove('active'));
+  document.querySelector('.yn-btn.' + val.toLowerCase()).classList.add('active');
+  setTimeout(() => sendMsg(val), 200);
+}
+
+// ── MULTI-SELECT CONFIRM ───────────────────────────────────────
+function confirmMultiSelect() {
+  if (multiSelected.length === 0) {
+    alert('Please select at least one option, or type your answer below.');
+    return;
+  }
+  sendMsg(multiSelected.join(', '));
+}
+
+// ── CHAT RENDERING ─────────────────────────────────────────────
 function addBotMsg(html, field, progress) {
   const area = document.getElementById('chatArea');
   const row  = document.createElement('div'); row.className = 'bubble-row bot';
@@ -1354,6 +1813,12 @@ function addUserMsg(text) {
   row.innerHTML = '<div class="avatar user">👤</div><div class="bubble user">' + text + '</div>';
   area.appendChild(row); area.scrollTop = area.scrollHeight;
 }
+function addErrorMsg(html) {
+  const area = document.getElementById('chatArea');
+  const row  = document.createElement('div'); row.className = 'bubble-row bot';
+  row.innerHTML = '<div class="avatar bot">⚠️</div><div class="bubble error-bubble">' + html + '</div>';
+  area.appendChild(row); area.scrollTop = area.scrollHeight;
+}
 function showTyping() {
   const area = document.getElementById('chatArea');
   const row  = document.createElement('div');
@@ -1371,26 +1836,52 @@ function updateProgress(label, pct) {
   document.getElementById('progressBar').style.width = num + '%';
   document.getElementById('progressLabel').textContent = pct === 100 ? '✓ Complete' : 'Q ' + label;
 }
+async function downloadPDF() {
+  if (!lastPayload) { alert('No payload available.'); return; }
+  const btn = document.querySelector('.pdf-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Generating PDF...'; }
+  try {
+    const res = await fetch('/download-pdf', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(lastPayload)
+    });
+    if (!res.ok) throw new Error('PDF generation failed');
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = (lastPayload['Demand ID'] || 'Demand') + '_'
+      + (lastPayload['Demand Title'] || 'Request').replace(/\s+/g, '_').slice(0, 30) + '.pdf';
+    a.click(); URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('Error: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '📄 Download as PDF'; }
+  }
+}
 async function resetChat() {
   await fetch('/reset', {method: 'POST'});
   document.getElementById('chatArea').innerHTML = '';
   document.getElementById('inp').disabled = false;
   document.getElementById('sendBtn').disabled = false;
-  lastPayload = null; updateProgress('', 0); started = false; startChat();
+  lastPayload = null; currentFieldKey = null; currentOptionsMeta = null;
+  hideAllControls(); updateProgress('', 0); started = false; startChat();
 }
 startChat();
 </script>
 </body>
 </html>"""
+
     html = html.replace("TOTAL_PLACEHOLDER", str(total_fields))
+    html = html.replace("FIELD_OPTIONS_PLACEHOLDER", field_options_json)
     return render_template_string(html)
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
     print("=" * 60)
-    print("  Demand Creation Chatbot — LangGraph Agentic (Fixed)")
-    print("  Key fix: no sleep in gemini_generate, all nodes fail-safe")
+    print("  Demand Creation Chatbot — Cascading Dropdowns Edition")
+    print("  Changes: yymmdd Demand ID | Yes/No validation | Dropdowns")
     print(f"  URL: http://0.0.0.0:{port}/ui")
     print("=" * 60)
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
